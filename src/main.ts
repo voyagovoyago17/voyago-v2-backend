@@ -1,4 +1,5 @@
 import * as dns from 'node:dns';
+import { exec } from 'node:child_process';
 import { NestFactory } from '@nestjs/core';
 import { ValidationPipe, Logger } from '@nestjs/common';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
@@ -123,6 +124,36 @@ async function bootstrap() {
 
   logger.log(`🦜 Voyago Multi-Tenant API running on http://localhost:${port}/api`);
   logger.log(`📚 Swagger Documentation available on http://localhost:${port}/api/docs`);
+
+  // 9. Auto ADB Reverse pour périphériques Android branchés en USB
+  if (process.env.NODE_ENV !== 'production') {
+    let lastAdbStatus = false;
+    const syncAdbReverse = () => {
+      const sdkAdb = process.env.LOCALAPPDATA
+        ? `"${process.env.LOCALAPPDATA}\\Android\\Sdk\\platform-tools\\adb.exe"`
+        : 'adb';
+      // Tente d'abord le chemin Android SDK, sinon le adb global
+      exec(`${sdkAdb} reverse tcp:${port} tcp:${port}`, (err) => {
+        if (!err) {
+          if (!lastAdbStatus) {
+            logger.log(`📱 ADB Reverse actif : port ${port} redirigé vers le smartphone USB`);
+            lastAdbStatus = true;
+          }
+        } else {
+          exec(`adb reverse tcp:${port} tcp:${port}`, (err2) => {
+            if (!err2 && !lastAdbStatus) {
+              logger.log(`📱 ADB Reverse actif : port ${port} redirigé vers le smartphone USB`);
+              lastAdbStatus = true;
+            } else if (err2) {
+              lastAdbStatus = false;
+            }
+          });
+        }
+      });
+    };
+    syncAdbReverse();
+    setInterval(syncAdbReverse, 8000);
+  }
 }
 
 bootstrap();
