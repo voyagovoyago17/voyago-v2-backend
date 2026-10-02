@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException, BadRequestException, Logger } from '@nestjs/common';
+import { Injectable, NotFoundException, BadRequestException, ForbiddenException, Logger } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import * as crypto from 'crypto';
@@ -16,6 +16,12 @@ import { CreatePostDto } from './dto/create-post.dto';
 import { ShareTripToCircleDto } from './dto/share-trip.dto';
 
 import { GLOBAL_DB_CONNECTION, TENANT_DB_CONNECTION } from '../common/constants';
+import { TripsService } from '../trips/trips.service';
+import { canViewTrip, tribeMateIds, tripVisibility, widerVisibility } from '../trips/trip-visibility';
+
+// Sans caractères ambigus (0/O, 1/I/L) pour un code facile à dicter
+const INVITE_CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+const INVITE_CODE_LENGTH = 8;
 
 @Injectable()
 export class CommunityService {
@@ -30,6 +36,7 @@ export class CommunityService {
     @InjectModel(UserSession.name, GLOBAL_DB_CONNECTION) private readonly sessionModel: Model<UserSessionDocument>,
     private readonly tenancyService: TenancyService,
     private readonly gamificationService: GamificationService,
+    private readonly tripsService: TripsService,
   ) {}
 
   // =========================================================================
@@ -52,13 +59,59 @@ export class CommunityService {
     return undefined;
   }
 
+  /** Utilisateur authentifié par son jeton uniquement (jamais par un paramètre de requête). */
+  private authUserId(authHeader?: string): Promise<string | undefined> {
+    return this.resolveUserId(undefined, authHeader);
+  }
+
+  /**
+   * Un cercle privé n'existe que pour ses membres : les autres reçoivent un 404,
+   * pour ne pas révéler son existence.
+   */
+  private async assertCircleAccess(circle: any, userId?: string): Promise<any | null> {
+    const membership = userId
+      ? await this.memberModel.findOne({ circle_id: circle.id, user_id: userId }).lean().exec()
+      : null;
+    if (!circle.is_public && !membership) {
+      throw new NotFoundException('Cercle introuvable');
+    }
+    return membership;
+  }
+
+  private async generateInviteCode(): Promise<string> {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const bytes = crypto.randomBytes(INVITE_CODE_LENGTH);
+      const code = Array.from(bytes, (b) => INVITE_CODE_ALPHABET[b % INVITE_CODE_ALPHABET.length]).join('');
+      if (!(await this.circleModel.exists({ invite_code: code }))) {
+        return code;
+      }
+    }
+    throw new BadRequestException("Impossible de générer un code d'invitation, réessaie");
+  }
+
+  private withoutInviteCode<T extends { invite_code?: string | null }>(circle: T): Omit<T, 'invite_code'> {
+    const { invite_code, ...rest } = circle;
+    return rest;
+  }
+
   // =========================================================================
   // 1. PUBLIC FEED & PUBLIC PROFILES (LOGIQUE EXISTANTE PRÉSERVÉE)
   // =========================================================================
 
-  async getPublicFeed(): Promise<object[]> {
+  /** Voyages publics, plus ceux « tribu » des membres de mes cercles si je suis connecté. */
+  async getPublicFeed(authHeader?: string): Promise<object[]> {
+    const viewerId = await this.authUserId(authHeader);
+    const filter: any = viewerId
+      ? {
+          $or: [
+            { is_public: true },
+            { visibility: 'tribe', user_id: { $in: await tribeMateIds(this.memberModel, viewerId) } },
+          ],
+        }
+      : { is_public: true };
+
     const trips = await this.sharedTripModel
-      .find({ is_public: true })
+      .find(filter)
       .sort({ created_at: -1 })
       .limit(50)
       .lean()
@@ -77,6 +130,7 @@ export class CommunityService {
       const cover = trip.cover_image_url || trip.pois?.[0]?.image_url || null;
       return {
         ...trip,
+        visibility: tripVisibility(trip),
         cover_image_url: cover,
         author: author
           ? {
@@ -166,8 +220,15 @@ export class CommunityService {
     await this.seedDefaultCirclesIfNeeded();
 
     const effectiveUserId = await this.resolveUserId(query.my_user_id, authHeader);
+    const viewerId = await this.authUserId(authHeader);
 
-    const filter: any = { is_public: true };
+    // Cercles publics + cercles privés dont le voyageur connecté est membre
+    const myPrivateCircleIds: string[] = viewerId
+      ? await this.memberModel.distinct('circle_id', { user_id: viewerId }).exec()
+      : [];
+    const filter: any = {
+      $and: [{ $or: [{ is_public: true }, { id: { $in: myPrivateCircleIds } }] }],
+    };
 
     if (query.category && query.category !== 'all') {
       filter.category = query.category;
@@ -261,7 +322,7 @@ export class CommunityService {
       }
 
       return {
-        ...circle,
+        ...this.withoutInviteCode(circle),
         members_count: realMembersCount,
         posts_count: realPostsCount,
         trips_count: realTripsCount,
@@ -295,6 +356,10 @@ export class CommunityService {
     if (!circle) {
       throw new NotFoundException(`Circle "${circleIdOrSlug}" introuvable`);
     }
+
+    const viewerId = await this.authUserId(authHeader);
+    const viewerMembership: any = await this.assertCircleAccess(circle, viewerId);
+    const canManageInvites = ['creator', 'admin'].includes(viewerMembership?.role);
 
     const effectiveUserId = await this.resolveUserId(currentUserId, authHeader);
 
@@ -350,7 +415,9 @@ export class CommunityService {
     const memberMap = new Map(memberUsers.map((u) => [u.user_id, u]));
 
     return {
-      ...circle,
+      ...this.withoutInviteCode(circle),
+      // Code d'invitation réservé au créateur et aux admins du cercle privé
+      invite_code: canManageInvites && !circle.is_public ? circle.invite_code || null : null,
       members_count: realMembersCount,
       posts_count: realPostsCount,
       trips_count: realTripsCount,
@@ -388,6 +455,7 @@ export class CommunityService {
     }
 
     const circleId = crypto.randomUUID();
+    const isPublic = dto.is_public !== undefined ? dto.is_public : true;
     let baseSlug = this.slugify(dto.name);
     let slug = baseSlug;
     let suffix = 1;
@@ -412,7 +480,8 @@ export class CommunityService {
       members_count: 1, // Créateur initial
       trips_count: 0,
       posts_count: 0,
-      is_public: dto.is_public !== undefined ? dto.is_public : true,
+      is_public: isPublic,
+      ...(isPublic ? {} : { invite_code: await this.generateInviteCode() }),
       tags: dto.tags || [],
       created_at: new Date(),
       updated_at: new Date(),
@@ -437,7 +506,45 @@ export class CommunityService {
     if (!circle) {
       throw new NotFoundException(`Cercle ${circleId} introuvable`);
     }
+    if (!circle.is_public) {
+      const member = await this.memberModel.exists({ circle_id: circleId, user_id: userId });
+      if (!member) {
+        throw new ForbiddenException("Ce cercle est privé : rejoins-le avec son code d'invitation");
+      }
+    }
+    return this.addMember(userId, circle);
+  }
 
+  /** Rejoindre un cercle (privé ou public) grâce à son code d'invitation. */
+  async joinCircleByCode(userId: string, code: string): Promise<object> {
+    const normalized = code.trim().toUpperCase();
+    const circle = normalized ? await this.circleModel.findOne({ invite_code: normalized }).exec() : null;
+    if (!circle) {
+      throw new NotFoundException("Code d'invitation invalide");
+    }
+    return { ...(await this.addMember(userId, circle)), slug: circle.slug, name: circle.name };
+  }
+
+  /** Nouveau code d'invitation : l'ancien ne fonctionne plus (créateur / admin uniquement). */
+  async regenerateInviteCode(userId: string, circleId: string): Promise<object> {
+    const circle = await this.circleModel.findOne({ id: circleId }).exec();
+    if (!circle) {
+      throw new NotFoundException(`Cercle ${circleId} introuvable`);
+    }
+    const membership: any = await this.assertCircleAccess(circle, userId);
+    if (!['creator', 'admin'].includes(membership?.role)) {
+      throw new ForbiddenException("Seuls le créateur et les admins gèrent les invitations");
+    }
+    if (circle.is_public) {
+      throw new BadRequestException("Un cercle public n'a pas besoin de code d'invitation");
+    }
+    circle.invite_code = await this.generateInviteCode();
+    await circle.save();
+    return { circle_id: circle.id, invite_code: circle.invite_code };
+  }
+
+  private async addMember(userId: string, circle: CommunityCircleDocument): Promise<object> {
+    const circleId = circle.id;
     const existing = await this.memberModel.findOne({ circle_id: circleId, user_id: userId }).exec();
     if (existing) {
       const realCount = await this.memberModel.countDocuments({ circle_id: circleId }).exec();
@@ -494,7 +601,18 @@ export class CommunityService {
   // 3. POSTS, MOMENTS & PARTAGES DE VOYAGES DANS LE CERCLE
   // =========================================================================
 
-  async getCirclePosts(circleId: string): Promise<object[]> {
+  async getCirclePosts(circleIdOrSlug: string, authHeader?: string): Promise<object[]> {
+    const circle: any = await this.circleModel
+      .findOne({ $or: [{ id: circleIdOrSlug }, { slug: circleIdOrSlug }] })
+      .lean()
+      .exec();
+    if (!circle) {
+      throw new NotFoundException(`Cercle ${circleIdOrSlug} introuvable`);
+    }
+    const viewerId = await this.authUserId(authHeader);
+    await this.assertCircleAccess(circle, viewerId);
+    const circleId = circle.id;
+
     const posts: any[] = await this.postModel
       .find({ circle_id: circleId })
       .sort({ created_at: -1 })
@@ -514,7 +632,17 @@ export class CommunityService {
       .find({ id: { $in: tripIds } })
       .lean()
       .exec();
-    const tripMap = new Map(trips.map((t) => [t.id, t]));
+    // Le voyage lié n'est joint que si le lecteur a le droit de le voir
+    const mates = new Set(viewerId ? await tribeMateIds(this.memberModel, viewerId) : []);
+    const visibleTrips = trips.filter((t) => {
+      const visibility = tripVisibility(t);
+      return (
+        visibility === 'public' ||
+        t.user_id === viewerId ||
+        (visibility === 'tribe' && mates.has(t.user_id))
+      );
+    });
+    const tripMap = new Map(visibleTrips.map((t) => [t.id, { ...t, visibility: tripVisibility(t) }]));
 
     return posts.map((post) => {
       const author = userMap.get(post.user_id);
@@ -542,6 +670,7 @@ export class CommunityService {
     if (!circle) {
       throw new NotFoundException(`Cercle ${circleId} introuvable`);
     }
+    await this.assertCircleAccess(circle, userId);
 
     const postId = crypto.randomUUID();
     const postData = {
@@ -593,26 +722,31 @@ export class CommunityService {
     if (!circle) {
       throw new NotFoundException(`Cercle ${circleId} introuvable`);
     }
+    await this.assertCircleAccess(circle, userId);
 
-    // Récupérer le voyage dans les voyages partagés ou dans le tenant de l'utilisateur
-    let trip: any = await this.sharedTripModel.findOne({ id: dto.trip_id }).lean().exec();
+    // On ne partage que ses propres voyages
+    const TripModel = await this.tenancyService.getTenantModel<any>(userId, 'Trip', TripSchema);
+    let trip: any = await TripModel.findOne({ id: dto.trip_id, user_id: userId }).lean().exec();
+    const inTenant = !!trip;
     if (!trip) {
-      const TripModel = await this.tenancyService.getTenantModel<any>(userId, 'Trip', TripSchema);
-      trip = await TripModel.findOne({ id: dto.trip_id }).lean().exec();
+      trip = await this.sharedTripModel.findOne({ id: dto.trip_id, user_id: userId }).lean().exec();
     }
 
     if (!trip) {
       throw new NotFoundException(`Itinéraire ${dto.trip_id} introuvable`);
     }
 
-    // S'assurer que le voyage est public dans le miroir partagé
-    try {
-      await this.sharedTripModel.updateOne(
-        { id: dto.trip_id },
-        { $set: { ...trip, is_public: true } },
-        { upsert: true },
-      ).exec();
-    } catch (_) {}
+    // Partager dans un cercle ouvre le voyage à son audience, sans jamais le restreindre :
+    // cercle public → public, cercle privé → au moins « tribu »
+    const visibility = widerVisibility(tripVisibility(trip), circle.is_public ? 'public' : 'tribe');
+    if (inTenant) {
+      await this.tripsService.updateVisibility(userId, trip.id, visibility);
+    } else {
+      await this.sharedTripModel
+        .updateOne({ id: trip.id }, { $set: { visibility, is_public: visibility === 'public' } })
+        .exec();
+    }
+    trip = { ...trip, visibility, is_public: visibility === 'public' };
 
     const cover = trip.cover_image_url || trip.pois?.[0]?.image_url || null;
     const postId = crypto.randomUUID();
@@ -663,11 +797,11 @@ export class CommunityService {
 
   async toggleLikeTrip(userId: string, tripId: string): Promise<object> {
     const trip = await this.sharedTripModel
-      .findOne({ id: tripId, is_public: true })
-      .select('liked_by')
+      .findOne({ id: tripId })
+      .select('liked_by user_id visibility is_public')
       .lean()
       .exec();
-    if (!trip) {
+    if (!trip || !(await canViewTrip(this.memberModel, trip, userId))) {
       throw new NotFoundException(`Voyage ${tripId} introuvable`);
     }
 
@@ -706,6 +840,10 @@ export class CommunityService {
     const post = await this.postModel.findOne({ id: postId }).exec();
     if (!post) {
       throw new NotFoundException(`Post ${postId} introuvable`);
+    }
+    const circle = await this.circleModel.findOne({ id: post.circle_id }).lean().exec();
+    if (circle) {
+      await this.assertCircleAccess(circle, userId);
     }
 
     const liked = post.liked_by.includes(userId);

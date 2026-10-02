@@ -59,4 +59,9 @@ export class GenerateTripDto {
   @IsString()
   @IsIn(['cold', 'balanced', 'warm'])
   thermal_sensitivity?: string;
+
+  /** Visibilité du voyage (privé par défaut) */
+  @IsOptional()
+  @IsIn(['private', 'tribe', 'public'])
+  visibility?: 'private' | 'tribe' | 'public';
 }

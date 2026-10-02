@@ -18,6 +18,14 @@ import { AiService } from '../ai/ai.service';
 import { TenancyService } from '../tenancy/tenancy.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { GLOBAL_DB_CONNECTION, TENANT_DB_CONNECTION } from '../common/constants';
+import { CommunityMember, CommunityMemberDocument } from '../community/schemas/community-member.schema';
+import {
+  TripVisibility,
+  canViewTrip,
+  sharesCircle,
+  tripVisibility,
+  visibilityFields,
+} from './trip-visibility';
 
 @Injectable()
 export class TripsService {
@@ -27,6 +35,7 @@ export class TripsService {
     // Static TENANT_DB connection — used for community feed (public trips mirror)
     @InjectModel(Trip.name, TENANT_DB_CONNECTION) private readonly sharedTripModel: Model<TripDocument>,
     @InjectModel(User.name, GLOBAL_DB_CONNECTION) private readonly userModel: Model<UserDocument>,
+    @InjectModel(CommunityMember.name, TENANT_DB_CONNECTION) private readonly memberModel: Model<CommunityMemberDocument>,
     private readonly aiService: AiService,
     private readonly tenancyService: TenancyService,
     private readonly notificationsService: NotificationsService,
@@ -48,7 +57,7 @@ export class TripsService {
 
   async getUserTrips(
     user_id: string,
-    options: { publicOnly?: boolean } = {},
+    options: { viewerId?: string } = {},
   ): Promise<Trip[]> {
     // Read from the user's own tenant database
     const TripModel = await this.tenancyService.getTenantModel<TripDocument>(
@@ -83,8 +92,15 @@ export class TripsService {
       }
     }
 
-    if (options.publicOnly) {
-      trips = trips.filter((t) => t.is_public !== false);
+    // L'auteur voit tout ; les autres voient les voyages publics, et ceux de la tribu s'ils partagent un cercle
+    if (options.viewerId !== user_id) {
+      const isTribeMate = options.viewerId
+        ? await sharesCircle(this.memberModel, options.viewerId, user_id)
+        : false;
+      trips = trips.filter((t) => {
+        const visibility = tripVisibility(t);
+        return visibility === 'public' || (visibility === 'tribe' && isTribeMate);
+      });
     }
 
     // Assurer que chaque voyage affiche l'édifice / monument réel de son pays
@@ -125,6 +141,8 @@ export class TripsService {
   }
 
   async getTripById(trip_id: string, user_id?: string): Promise<Trip> {
+    // user_id = voyageur connecté : son propre voyage est lu dans son tenant,
+    // sinon la copie partagée n'est servie que si la visibilité le permet
     let trip: any = null;
     let model: any = null;
 
@@ -143,6 +161,9 @@ export class TripsService {
     if (!trip) {
       model = this.sharedTripModel;
       trip = await this.sharedTripModel.findOne({ id: trip_id }).exec();
+      if (trip && !(await canViewTrip(this.memberModel, trip, user_id))) {
+        trip = null;
+      }
     }
 
     if (!trip) {
@@ -306,6 +327,7 @@ export class TripsService {
 
     // 3. Create trip document in user's tenant DB
     const tripId = uuidv4();
+    const visibility: TripVisibility = dto.visibility ?? 'private';
 
     const tripData = {
       id: tripId,
@@ -325,15 +347,15 @@ export class TripsService {
       interests: dto.interests,
       pois: poisWithImages,
       weather,
-      is_public: true,
+      ...visibilityFields(visibility),
       likes: 0,
       created_at: new Date(),
     };
 
     const trip = await TripModel.create(tripData);
 
-    // 4. Mirror to shared DB for community feed (public trips only)
-    if (tripData.is_public) {
+    // 4. Mirror to shared DB for community feed (public & tribe trips only)
+    if (visibility !== 'private') {
       try {
         await this.sharedTripModel.create(tripData);
       } catch (err) {
@@ -405,5 +427,39 @@ export class TripsService {
     });
 
     return trip;
+  }
+
+  /**
+   * Change la visibilité d'un voyage de l'auteur.
+   * La copie partagée (fil, cercles, likes) est créée au besoin, et conservée
+   * en privé pour garder ses likes si le voyage redevient visible.
+   */
+  async updateVisibility(userId: string, tripId: string, visibility: TripVisibility) {
+    const TripModel = await this.tenancyService.getTenantModel<TripDocument>(userId, 'Trip', TripSchema);
+    const trip: any = await TripModel.findOneAndUpdate(
+      { id: tripId, user_id: userId },
+      { $set: visibilityFields(visibility) },
+      { new: true },
+    )
+      .lean()
+      .exec();
+    if (!trip) {
+      throw new NotFoundException(`Trip ${tripId} not found`);
+    }
+
+    if (visibility === 'private') {
+      await this.sharedTripModel.updateOne({ id: tripId }, { $set: visibilityFields(visibility) }).exec();
+    } else {
+      const { _id, __v, likes, liked_by, ...mirror } = trip;
+      await this.sharedTripModel
+        .updateOne(
+          { id: tripId },
+          { $set: mirror, $setOnInsert: { likes: 0, liked_by: [] } },
+          { upsert: true },
+        )
+        .exec();
+    }
+
+    return { trip_id: tripId, ...visibilityFields(visibility) };
   }
 }

@@ -83,8 +83,13 @@ export class Trip {
   @Prop({ required: false })
   end_date?: string;
 
-  @Prop({ default: true })
+  /** Toujours égal à `visibility === 'public'` (le fil public filtre dessus) */
+  @Prop({ default: false })
   is_public: boolean;
+
+  /** private | tribe | public — absent sur les anciens voyages (déduit de is_public) */
+  @Prop({ type: String, enum: ['private', 'tribe', 'public'], required: false })
+  visibility?: 'private' | 'tribe' | 'public';
 
   @Prop({ default: 0 })
   likes: number;
@@ -113,6 +118,7 @@ TripSchema.index({ user_id: 1 });
 TripSchema.index({ user_id: 1, tenant_id: 1 });
 TripSchema.index({ is_public: 1, created_at: -1 });
 TripSchema.index({ tenant_id: 1, is_public: 1, created_at: -1 });
+TripSchema.index({ visibility: 1, user_id: 1, created_at: -1 });
 TripSchema.index({ destination: 1 });
 TripSchema.index({ city: 1 });
 TripSchema.index({ country: 1 });

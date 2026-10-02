@@ -15,6 +15,7 @@ import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { CreateCircleDto } from './dto/create-circle.dto';
 import { CreatePostDto } from './dto/create-post.dto';
 import { ShareTripToCircleDto } from './dto/share-trip.dto';
+import { JoinCircleByCodeDto } from './dto/join-by-code.dto';
 
 @Controller('community')
 export class CommunityController {
@@ -25,8 +26,8 @@ export class CommunityController {
   // =========================================================================
 
   @Get('feed')
-  async getPublicFeed() {
-    return this.communityService.getPublicFeed();
+  async getPublicFeed(@Headers('authorization') authHeader?: string) {
+    return this.communityService.getPublicFeed(authHeader);
   }
 
   @Get('user/:id')
@@ -74,6 +75,16 @@ export class CommunityController {
     return this.communityService.createCircle(user.user_id, dto);
   }
 
+  /** Rejoindre un cercle privé avec son code d'invitation */
+  @Post('circles/join-by-code')
+  @UseGuards(SessionAuthGuard)
+  async joinCircleByCode(
+    @CurrentUser() user: any,
+    @Body() dto: JoinCircleByCodeDto,
+  ) {
+    return this.communityService.joinCircleByCode(user.user_id, dto.code);
+  }
+
   @Get('circles/:id')
   async getCircleById(
     @Param('id') id: string,
@@ -90,6 +101,16 @@ export class CommunityController {
     @Param('id') id: string,
   ) {
     return this.communityService.joinCircle(user.user_id, id);
+  }
+
+  /** Générer un nouveau code d'invitation (créateur / admin d'un cercle privé) */
+  @Post('circles/:id/invite-code')
+  @UseGuards(SessionAuthGuard)
+  async regenerateInviteCode(
+    @CurrentUser() user: any,
+    @Param('id') id: string,
+  ) {
+    return this.communityService.regenerateInviteCode(user.user_id, id);
   }
 
   @Post('circles/:id/leave')
@@ -115,8 +136,11 @@ export class CommunityController {
   // =========================================================================
 
   @Get('circles/:id/posts')
-  async getCirclePosts(@Param('id') id: string) {
-    return this.communityService.getCirclePosts(id);
+  async getCirclePosts(
+    @Param('id') id: string,
+    @Headers('authorization') authHeader?: string,
+  ) {
+    return this.communityService.getCirclePosts(id, authHeader);
   }
 
   @Post('circles/:id/posts')

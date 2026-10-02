@@ -12,6 +12,7 @@ import { TenancyService } from '../tenancy/tenancy.service';
 import { GamificationService } from '../gamification/gamification.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { UploadService } from '../upload/upload.service';
+import { TripsService } from '../trips/trips.service';
 import { GLOBAL_DB_CONNECTION, TENANT_DB_CONNECTION } from '../common/constants';
 
 const MAX_PHOTOS_PER_ENTRY = 6;
@@ -30,6 +31,7 @@ export class JournalService {
     private readonly gamificationService: GamificationService,
     private readonly notificationsService: NotificationsService,
     private readonly uploadService: UploadService,
+    private readonly tripsService: TripsService,
   ) {}
 
   private tripModel(userId: string) {
@@ -214,24 +216,24 @@ export class JournalService {
     return this.setCompleted(userId, tripId, null);
   }
 
-  /** Partage le journal à la communauté : +XP la première fois. */
+  /** Partage le journal à la communauté (le voyage devient public) : +XP la première fois. */
   async share(userId: string, tripId: string) {
     const TripModel = await this.tripModel(userId);
     // Mise à jour conditionnelle : un double appel ne rapporte l'XP qu'une fois
     const res = await TripModel.updateOne(
       { id: tripId, user_id: userId, journal_shared_at: null },
-      { $set: { journal_shared_at: new Date(), is_public: true } },
+      { $set: { journal_shared_at: new Date() } },
     ).exec();
 
     if (res.matchedCount === 0) {
       await this.assertTrip(userId, tripId);
+    }
+    // Rend le voyage public et (re)crée sa copie partagée pour le fil communautaire
+    await this.tripsService.updateVisibility(userId, tripId, 'public');
+
+    if (res.matchedCount === 0) {
       return { shared: true, xp_awarded: 0, gamification: null };
     }
-
-    this.sharedTripModel
-      .updateOne({ id: tripId }, { $set: { journal_shared_at: new Date(), is_public: true } })
-      .exec()
-      .catch(() => {});
 
     let gamification: any = null;
     try {

@@ -2,6 +2,7 @@ import {
   Controller,
   Get,
   Post,
+  Patch,
   Body,
   Param,
   UseGuards,
@@ -11,6 +12,7 @@ import { SessionAuthGuard } from '../common/guards/session-auth.guard';
 import { OptionalSessionAuthGuard } from '../common/guards/optional-session-auth.guard';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { GenerateTripDto } from './dto/generate-trip.dto';
+import { UpdateTripVisibilityDto } from './dto/update-visibility.dto';
 
 @Controller()
 export class TripsController {
@@ -22,9 +24,8 @@ export class TripsController {
     @Param('user_id') user_id: string,
     @CurrentUser() user: any,
   ) {
-    // Owners see all their trips; everyone else only sees public ones
-    const isOwner = user?.user_id === user_id;
-    return this.tripsService.getUserTrips(user_id, { publicOnly: !isOwner });
+    // Owners see all their trips; others see public ones (and tribe ones if they share a circle)
+    return this.tripsService.getUserTrips(user_id, { viewerId: user?.user_id });
   }
 
   @Get('trip/:trip_id')
@@ -33,6 +34,17 @@ export class TripsController {
     // Authenticated owners are looked up in their tenant DB first;
     // otherwise the public lookup falls through to the shared DB
     return this.tripsService.getTripById(trip_id, user?.user_id);
+  }
+
+  /** Rendre un voyage privé, visible par sa tribu ou public */
+  @Patch('trip/:trip_id/visibility')
+  @UseGuards(SessionAuthGuard)
+  async updateVisibility(
+    @CurrentUser() user: any,
+    @Param('trip_id') trip_id: string,
+    @Body() dto: UpdateTripVisibilityDto,
+  ) {
+    return this.tripsService.updateVisibility(user.user_id, trip_id, dto.visibility);
   }
 
   @Post('trips/generate')

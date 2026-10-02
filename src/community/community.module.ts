@@ -11,6 +11,7 @@ import { CommunityPost, CommunityPostSchema } from './schemas/community-post.sch
 import { SessionAuthGuard } from '../common/guards/session-auth.guard';
 import { TenancyModule } from '../tenancy/tenancy.module';
 import { GamificationModule } from '../gamification/gamification.module';
+import { TripsModule } from '../trips/trips.module';
 
 import { GLOBAL_DB_CONNECTION, TENANT_DB_CONNECTION } from '../common/constants';
 
@@ -35,6 +36,7 @@ import { GLOBAL_DB_CONNECTION, TENANT_DB_CONNECTION } from '../common/constants'
     ),
     TenancyModule,
     GamificationModule,
+    TripsModule,
   ],
   controllers: [CommunityController],
   providers: [CommunityService, SessionAuthGuard],

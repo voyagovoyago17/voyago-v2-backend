@@ -47,6 +47,10 @@ export class CommunityCircle {
   @Prop({ default: true })
   is_public: boolean;
 
+  /** Code d'invitation des cercles privés (seul moyen de les rejoindre) */
+  @Prop({ type: String, required: false })
+  invite_code?: string;
+
   @Prop({ type: [String], default: [] })
   tags: string[];
 
@@ -58,3 +62,9 @@ export class CommunityCircle {
 }
 
 export const CommunityCircleSchema = SchemaFactory.createForClass(CommunityCircle);
+
+// Unicité des codes d'invitation, en ignorant les cercles qui n'en ont pas
+CommunityCircleSchema.index(
+  { invite_code: 1 },
+  { unique: true, partialFilterExpression: { invite_code: { $type: 'string' } } },
+);
