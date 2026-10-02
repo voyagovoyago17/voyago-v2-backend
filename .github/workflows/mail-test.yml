@@ -1,0 +1,30 @@
+name: Test e-mail (Resend)
+
+# Lancé à la main depuis l'onglet Actions : diagnostic Resend avec la configuration de production
+on:
+  workflow_dispatch:
+    inputs:
+      to:
+        description: "Adresse qui recevra l'e-mail de test (vide = diagnostic sans envoi)"
+        required: false
+        default: ''
+
+jobs:
+  mail-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Diagnostic et envoi depuis le serveur
+        uses: appleboy/ssh-action@v1
+        env:
+          MAIL_TEST_TO: ${{ inputs.to }}
+        with:
+          host: ${{ secrets.VOYAGO_HOST }}
+          username: ${{ secrets.VOYAGO_USER }}
+          key: ${{ secrets.VOYAGO_SSH_KEY }}
+          port: ${{ secrets.VOYAGO_PORT || 22 }}
+          envs: MAIL_TEST_TO
+          script: |
+            cd /var/www/voyago/backend
+            node scripts/test-mail.js "$MAIL_TEST_TO"
+            echo "--- Derniers logs e-mail de l'API ---"
+            PATH="$HOME/.local/bin:$PATH" pm2 logs voyago-api --lines 300 --nostream 2>&1 | grep -iE "resend|mail|e-mail" | tail -25 || true

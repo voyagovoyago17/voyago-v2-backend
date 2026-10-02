@@ -49,7 +49,8 @@ function hintFor(message = '') {
     ko('RESEND_API_KEY absente : le backend écrit les codes dans les logs au lieu de les envoyer.');
     process.exit(1);
   }
-  ok(`RESEND_API_KEY présente (${key.slice(0, 5)}…${key.slice(-4)})`);
+  // Jamais la clé elle-même dans les logs (sortie visible dans GitHub Actions)
+  ok(`RESEND_API_KEY présente (${key.length} caractères)`);
   if (!key.startsWith('re_')) ko('La clé devrait commencer par « re_ » : vérifie la valeur copiée.');
   const fromDomain = (from.match(/@([^>\s]+)/) || [])[1];
   info(`Expéditeur (MAIL_FROM) : ${from}`);
