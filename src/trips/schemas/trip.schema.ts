@@ -105,6 +105,10 @@ export class Trip {
   @Prop({ type: [Object], default: [] })
   gems: any[];
 
+  /** Pépites générées a posteriori (voyage créé avant le radar) : une seule tentative */
+  @Prop({ type: Date, default: null })
+  gems_backfilled_at?: Date | null;
+
   /** Début du radar pour un voyage sans dates (« Démarrer mon voyage ») */
   @Prop({ type: Date, default: null })
   gems_started_at?: Date | null;

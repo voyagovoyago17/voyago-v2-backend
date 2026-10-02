@@ -1,6 +1,7 @@
 import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { TenancyService } from '../tenancy/tenancy.service';
 import { GamificationService } from '../gamification/gamification.service';
+import { AiService } from '../ai/ai.service';
 import { TripDocument, TripSchema } from './schemas/trip.schema';
 
 /** XP d'une pépite selon sa rareté (fixée par le serveur, jamais par l'IA ni l'app) */
@@ -71,6 +72,7 @@ export class TripGemsService {
   constructor(
     private readonly tenancyService: TenancyService,
     private readonly gamificationService: GamificationService,
+    private readonly aiService: AiService,
   ) {}
 
   private tripModel(userId: string) {
@@ -80,7 +82,7 @@ export class TripGemsService {
   private async loadTrip(userId: string, tripId: string): Promise<any> {
     const TripModel = await this.tripModel(userId);
     const trip: any = await TripModel.findOne({ id: tripId, user_id: userId })
-      .select('id destination duration_days start_date end_date completed_at gems gems_started_at')
+      .select('id destination duration_days start_date end_date completed_at gems gems_started_at gems_backfilled_at')
       .lean()
       .exec();
     if (!trip) {
@@ -106,7 +108,39 @@ export class TripGemsService {
 
   /** Pépites de mon voyage et état du radar (réservé à l'auteur du voyage). */
   async getGems(userId: string, tripId: string) {
-    return this.toDto(await this.loadTrip(userId, tripId));
+    const trip = await this.loadTrip(userId, tripId);
+    if (!trip.gems?.length && !trip.gems_backfilled_at && !gemsWindow(trip).ended) {
+      trip.gems = await this.backfillGems(userId, tripId);
+    }
+    return this.toDto(trip);
+  }
+
+  /**
+   * Voyage créé avant le radar : génère ses pépites une seule fois (petit appel IA dédié).
+   * Le marqueur est posé avant l'appel pour éviter toute double génération.
+   */
+  private async backfillGems(userId: string, tripId: string): Promise<any[]> {
+    const TripModel = await this.tripModel(userId);
+    const claimed = await TripModel.updateOne(
+      { id: tripId, gems_backfilled_at: null },
+      { $set: { gems_backfilled_at: new Date() } },
+    ).exec();
+    if (claimed.modifiedCount === 0) return [];
+
+    const full: any = await TripModel.findOne({ id: tripId }).select('destination duration_days transports pois').lean().exec();
+    if (!full?.pois?.length) return [];
+    const generated = await this.aiService.generateGemsForItinerary(full);
+    const gems = await Promise.all(
+      generated.map(async (g) => ({
+        ...g,
+        image_url: await this.aiService.fetchWikipediaImage(g.image_query, undefined).catch(() => null),
+      })),
+    );
+    if (gems.length) {
+      await TripModel.updateOne({ id: tripId }, { $set: { gems } }).exec();
+      this.logger.log(`${gems.length} pépites ajoutées au voyage ${tripId}`);
+    }
+    return gems;
   }
 
   /** Voyage sans dates : démarre le radar pour la durée du voyage. */

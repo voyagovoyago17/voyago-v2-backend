@@ -52,6 +52,19 @@ const TRIP_POIS_RESPONSE_SCHEMA: ResponseSchema = {
   required: ['pois'],
 };
 
+/** Voyage classique : les pépites sont exigées (sinon Gemini omet souvent ce champ facultatif). */
+const TRIP_POIS_WITH_GEMS_RESPONSE_SCHEMA: ResponseSchema = {
+  ...TRIP_POIS_RESPONSE_SCHEMA,
+  required: ['pois', 'gems'],
+};
+
+/** Pépites seules (voyages existants sans pépites) */
+const GEMS_ONLY_RESPONSE_SCHEMA: ResponseSchema = {
+  type: SchemaType.OBJECT,
+  properties: { gems: { type: SchemaType.ARRAY, items: GEM_RESPONSE_SCHEMA } },
+  required: ['gems'],
+};
+
 /** Raretés des pépites (l'XP correspondante est fixée par le serveur, jamais par l'IA). */
 export const GEM_RARITIES = ['commune', 'rare', 'legendaire'] as const;
 export type GemRarity = (typeof GEM_RARITIES)[number];
@@ -263,6 +276,79 @@ export class AiService {
 
     // 3. Fallback to dynamic real-venue generation (sans pépites)
     return { pois: await this.generateDynamicPois(dto), gems: [] };
+  }
+
+  /**
+   * Pépites pour un voyage existant qui n'en a pas (créé avant le radar) : petit appel
+   * dédié, à partir des lieux de l'itinéraire. Renvoie [] si aucune IA ne répond.
+   */
+  async generateGemsForItinerary(trip: {
+    destination: string;
+    duration_days: number;
+    transports?: string[];
+    pois: POI[];
+  }): Promise<TripGem[]> {
+    const days = Math.max(1, trip.duration_days || 1);
+    const count = expectedGemCount(days);
+    const dto = { destination: trip.destination, duration_days: days, purpose: 'trip' } as GenerateTripDto;
+    const itinerary = Array.from({ length: days }, (_, i) => i + 1)
+      .map((day) => {
+        const list = trip.pois
+          .filter((p) => p.day === day)
+          .map((p) => `${p.name} (${Number(p.lat).toFixed(5)}, ${Number(p.lng).toFixed(5)})`)
+          .join(' ; ');
+        return list ? `- Jour ${day} : ${list}` : '';
+      })
+      .filter(Boolean)
+      .join('\n');
+    const transports = (trip.transports || ['marche']).join(', ');
+
+    const prompt = `Tu es Voyago, guide local d'exception à ${trip.destination}.
+Voici l'itinéraire d'un voyageur (lieux et coordonnées GPS) :
+${itinerary}
+
+Propose exactement ${count} "gems", 1 par jour (champ "day"), que le voyageur ramassera sur place pour gagner de l'XP : elles doivent donner envie de faire un détour.
+- Lieux réels, secrets ou insolites (bar caché, atelier d'artisan, point de vue confidentiel, cour intérieure, street-art, librairie, marché de quartier...), ABSENTS de l'itinéraire.
+- Situés à 300 m - 1 km des lieux du même jour : un vrai détour, faisable ${transports}.
+- "teaser" : 1 phrase en français (20 mots max) qui intrigue sans tout dévoiler, avec un indice concret.
+- "rarity" : "commune" (la plupart), "rare" (vraiment confidentiel), "legendaire" (1 seule, la plus exceptionnelle).
+- "lat"/"lng" exacts du lieu (5 décimales) ; "image_query" = nom du lieu + ville.
+
+Réponds avec UNIQUEMENT un objet JSON compact : {"gems":[{"name":"...","teaser":"...","lat":0.00000,"lng":0.00000,"day":1,"category":"bar","rarity":"commune","image_query":"..."}]}`;
+
+    const parse = (text: string) => {
+      const parsed = JSON.parse(text.replace(/```json/g, '').replace(/```/g, '').trim());
+      return this.sanitizeGems(parsed.gems, trip.pois, dto);
+    };
+
+    if (this.genAI) {
+      for (const modelName of ['gemini-3.5-flash-lite', 'gemini-flash-lite-latest', 'gemini-flash-latest']) {
+        try {
+          const model = this.genAI.getGenerativeModel({
+            model: modelName,
+            generationConfig: { responseMimeType: 'application/json', responseSchema: GEMS_ONLY_RESPONSE_SCHEMA, temperature: 0.7 },
+          });
+          const gems = parse((await model.generateContent(prompt)).response.text());
+          if (gems.length) return gems;
+        } catch (err: any) {
+          this.logger.warn(`Gems generation with ${modelName} failed: ${err.message}`);
+        }
+      }
+    }
+    if (this.anthropic) {
+      try {
+        const message = await this.anthropic.messages.create({
+          model: 'claude-haiku-4-5',
+          max_tokens: 2000 + count * TOKENS_PER_GEM,
+          messages: [{ role: 'user', content: prompt }],
+        });
+        const textBlock = message.content.find((b): b is Anthropic.TextBlock => b.type === 'text');
+        if (textBlock) return parse(textBlock.text);
+      } catch (err: any) {
+        this.logger.warn(`Gems generation with Claude failed: ${err.message}`);
+      }
+    }
+    return [];
   }
 
   /** Les pépites ne sont demandées que pour un voyage classique (pas pour un vote de tribu). */
@@ -528,7 +614,7 @@ Avant de répondre, vérifie : ${totalPoisCount} lieux, ${activitiesPerDay} par 
           generationConfig: {
             responseMimeType: 'application/json',
             // Schéma imposé : JSON toujours valide, donc moins de relances vers un autre modèle
-            responseSchema: TRIP_POIS_RESPONSE_SCHEMA,
+            responseSchema: this.wantsGems(dto) ? TRIP_POIS_WITH_GEMS_RESPONSE_SCHEMA : TRIP_POIS_RESPONSE_SCHEMA,
             temperature: 0.7,
           },
         });
