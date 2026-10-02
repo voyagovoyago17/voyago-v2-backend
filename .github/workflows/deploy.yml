@@ -1,0 +1,45 @@
+name: Deploy to VPS
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Vérifie que le code compile avant de toucher au serveur
+      - name: Build
+        run: npm run build
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VOYAGO_HOST }}
+          username: ${{ secrets.VOYAGO_USER }}
+          key: ${{ secrets.VOYAGO_SSH_KEY }}
+          port: ${{ secrets.VOYAGO_PORT || 22 }}
+          script: |
+            set -e
+            cd /var/www/voyago/backend
+            git pull origin main
+            # Le build a besoin des dépendances de dev (@nestjs/cli, typescript) :
+            # installation complète, build, puis retrait des dépendances de dev
+            npm ci
+            npm run build
+            npm prune --omit=dev
+            PATH="$HOME/.local/bin:$PATH" pm2 restart voyago-api --update-env
