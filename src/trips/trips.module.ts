@@ -4,6 +4,8 @@ import { TripsController } from './trips.controller';
 import { TripsService } from './trips.service';
 import { Trip, TripSchema } from './schemas/trip.schema';
 import { CommunityMember, CommunityMemberSchema } from '../community/schemas/community-member.schema';
+import { UserBlock, UserBlockSchema } from '../community/schemas/user-block.schema';
+import { GamificationModule } from '../gamification/gamification.module';
 import { User, UserSchema } from '../auth/schemas/user.schema';
 import { UserSession, UserSessionSchema } from '../auth/schemas/user-session.schema';
 import { SessionAuthGuard } from '../common/guards/session-auth.guard';
@@ -22,6 +24,8 @@ import { GLOBAL_DB_CONNECTION, TENANT_DB_CONNECTION } from '../common/constants'
         { name: Trip.name, schema: TripSchema },
         // Appartenance aux cercles : visibilité « tribu » des voyages
         { name: CommunityMember.name, schema: CommunityMemberSchema },
+        // Blocages entre voyageurs : voyages masqués dans les deux sens
+        { name: UserBlock.name, schema: UserBlockSchema },
       ],
       TENANT_DB_CONNECTION,
     ),
@@ -35,6 +39,7 @@ import { GLOBAL_DB_CONNECTION, TENANT_DB_CONNECTION } from '../common/constants'
     AiModule,
     TenancyModule,
     NotificationsModule,
+    GamificationModule,
   ],
   controllers: [TripsController],
   providers: [TripsService, SessionAuthGuard, OptionalSessionAuthGuard],

@@ -25,6 +25,13 @@ export class UserXpAction {
 
   @Prop({ default: Date.now })
   completed_at: Date;
+
+  /** Plafond quotidien : jour (AAAA-MM-JJ, UTC) et nombre d'attributions ce jour-là */
+  @Prop({ type: String, required: false })
+  day?: string;
+
+  @Prop({ default: 0 })
+  day_count: number;
 }
 
 export const UserXpActionSchema = SchemaFactory.createForClass(UserXpAction);

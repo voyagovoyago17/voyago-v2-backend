@@ -101,6 +101,14 @@ export class Trip {
   @Prop({ default: 0 })
   comments_count: number;
 
+  /** Nombre de voyageurs ayant refait ce voyage (copie partagée) */
+  @Prop({ default: 0 })
+  remix_count: number;
+
+  /** Voyage d'origine quand celui-ci a été créé via « Refaire ce voyage » */
+  @Prop({ type: Object, default: null })
+  remixed_from?: { trip_id: string; user_id: string; destination?: string } | null;
+
   @Prop({ default: Date.now })
   created_at: Date;
 

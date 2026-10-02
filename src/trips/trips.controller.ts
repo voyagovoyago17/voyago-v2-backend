@@ -13,6 +13,7 @@ import { OptionalSessionAuthGuard } from '../common/guards/optional-session-auth
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { GenerateTripDto } from './dto/generate-trip.dto';
 import { UpdateTripVisibilityDto } from './dto/update-visibility.dto';
+import { RemixTripDto } from './dto/remix-trip.dto';
 
 @Controller()
 export class TripsController {
@@ -45,6 +46,17 @@ export class TripsController {
     @Body() dto: UpdateTripVisibilityDto,
   ) {
     return this.tripsService.updateVisibility(user.user_id, trip_id, dto.visibility);
+  }
+
+  /** « Refaire ce voyage » : copie un itinéraire visible dans mes voyages (privé) */
+  @Post('trip/:trip_id/remix')
+  @UseGuards(SessionAuthGuard)
+  async remixTrip(
+    @CurrentUser() user: any,
+    @Param('trip_id') trip_id: string,
+    @Body() dto: RemixTripDto,
+  ) {
+    return this.tripsService.remixTrip(user, trip_id, dto.start_date);
   }
 
   @Post('trips/generate')

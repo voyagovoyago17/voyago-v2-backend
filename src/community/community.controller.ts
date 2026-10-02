@@ -49,8 +49,30 @@ export class CommunityController {
   }
 
   @Get('user/:id')
-  async getUserPublicProfile(@Param('id') id: string) {
-    return this.communityService.getUserPublicProfile(id);
+  async getUserPublicProfile(
+    @Param('id') id: string,
+    @Headers('authorization') authHeader?: string,
+  ) {
+    return this.communityService.getUserPublicProfile(id, authHeader);
+  }
+
+  // Blocage : les contenus des deux voyageurs sont masqués l'un pour l'autre
+  @Get('blocks')
+  @UseGuards(SessionAuthGuard)
+  async listBlockedUsers(@CurrentUser() user: any) {
+    return this.communityService.listBlockedUsers(user.user_id);
+  }
+
+  @Post('users/:id/block')
+  @UseGuards(SessionAuthGuard)
+  async blockUser(@CurrentUser() user: any, @Param('id') id: string) {
+    return this.communityService.blockUser(user.user_id, id);
+  }
+
+  @Delete('users/:id/block')
+  @UseGuards(SessionAuthGuard)
+  async unblockUser(@CurrentUser() user: any, @Param('id') id: string) {
+    return this.communityService.unblockUser(user.user_id, id);
   }
 
   @Post('trip/:id/like')

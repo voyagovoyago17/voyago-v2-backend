@@ -11,6 +11,8 @@ import { GamificationService } from '../gamification/gamification.service';
 import { CommunityCircle, CommunityCircleDocument } from './schemas/community-circle.schema';
 import { CommunityMember, CommunityMemberDocument } from './schemas/community-member.schema';
 import { CommunityPost, CommunityPostDocument } from './schemas/community-post.schema';
+import { UserBlock, UserBlockDocument } from './schemas/user-block.schema';
+import { hiddenUserIds, isBlockedBetween } from './blocks';
 import { CreateCircleDto } from './dto/create-circle.dto';
 import { CreatePostDto } from './dto/create-post.dto';
 import { ShareTripToCircleDto } from './dto/share-trip.dto';
@@ -18,6 +20,9 @@ import { ShareTripToCircleDto } from './dto/share-trip.dto';
 import { GLOBAL_DB_CONNECTION, TENANT_DB_CONNECTION } from '../common/constants';
 import { TripsService } from '../trips/trips.service';
 import { canViewTrip, tribeMateIds, tripVisibility, widerVisibility } from '../trips/trip-visibility';
+
+/** Nombre de likes qui rend un voyage « populaire » (XP + badge pour son auteur) */
+const POPULAR_TRIP_LIKES = 10;
 
 // Sans caractères ambigus (0/O, 1/I/L) pour un code facile à dicter
 const INVITE_CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
@@ -32,6 +37,7 @@ export class CommunityService {
     @InjectModel(CommunityCircle.name, TENANT_DB_CONNECTION) private readonly circleModel: Model<CommunityCircleDocument>,
     @InjectModel(CommunityMember.name, TENANT_DB_CONNECTION) private readonly memberModel: Model<CommunityMemberDocument>,
     @InjectModel(CommunityPost.name, TENANT_DB_CONNECTION) private readonly postModel: Model<CommunityPostDocument>,
+    @InjectModel(UserBlock.name, TENANT_DB_CONNECTION) private readonly blockModel: Model<UserBlockDocument>,
     @InjectModel(User.name, GLOBAL_DB_CONNECTION) private readonly userModel: Model<UserDocument>,
     @InjectModel(UserSession.name, GLOBAL_DB_CONNECTION) private readonly sessionModel: Model<UserSessionDocument>,
     private readonly tenancyService: TenancyService,
@@ -109,6 +115,8 @@ export class CommunityService {
           ],
         }
       : { is_public: true };
+    const hidden = await hiddenUserIds(this.blockModel, viewerId);
+    if (hidden.length) filter.user_id = { $nin: hidden };
 
     const trips = await this.sharedTripModel
       .find(filter)
@@ -165,16 +173,22 @@ export class CommunityService {
         ])
       : [[] as string[], [] as string[]];
 
+    const hidden = await hiddenUserIds(this.blockModel, viewerId);
     const tripFilter: any = {
       created_at: { $lt: beforeDate },
       $or: [{ is_public: true }, ...(viewerId ? [{ visibility: 'tribe', user_id: { $in: mates } }] : [])],
+      ...(hidden.length ? { user_id: { $nin: hidden } } : {}),
     };
 
     const [trips, posts]: [any[], any[]] = await Promise.all([
       this.sharedTripModel.find(tripFilter).select('-weather').sort({ created_at: -1 }).limit(pageSize).lean().exec(),
       myCircleIds.length
         ? this.postModel
-            .find({ circle_id: { $in: myCircleIds }, created_at: { $lt: beforeDate } })
+            .find({
+              circle_id: { $in: myCircleIds },
+              created_at: { $lt: beforeDate },
+              ...(hidden.length ? { user_id: { $nin: hidden } } : {}),
+            })
             .sort({ created_at: -1 })
             .limit(pageSize)
             .lean()
@@ -275,9 +289,10 @@ export class CommunityService {
     };
   }
 
-  async getUserPublicProfile(user_id: string): Promise<object> {
+  async getUserPublicProfile(user_id: string, authHeader?: string): Promise<object> {
+    const viewerId = await this.authUserId(authHeader);
     const user = await this.userModel.findOne({ user_id }).lean().exec();
-    if (!user) {
+    if (!user || (await isBlockedBetween(this.blockModel, viewerId, user_id))) {
       throw new NotFoundException(`User ${user_id} not found`);
     }
 
@@ -742,8 +757,9 @@ export class CommunityService {
     await this.assertCircleAccess(circle, viewerId);
     const circleId = circle.id;
 
+    const hidden = await hiddenUserIds(this.blockModel, viewerId);
     const posts: any[] = await this.postModel
-      .find({ circle_id: circleId })
+      .find({ circle_id: circleId, ...(hidden.length ? { user_id: { $nin: hidden } } : {}) })
       .sort({ created_at: -1 })
       .limit(50)
       .lean()
@@ -930,7 +946,11 @@ export class CommunityService {
       .select('liked_by user_id visibility is_public')
       .lean()
       .exec();
-    if (!trip || !(await canViewTrip(this.memberModel, trip, userId))) {
+    if (
+      !trip ||
+      !(await canViewTrip(this.memberModel, trip, userId)) ||
+      (await isBlockedBetween(this.blockModel, userId, trip.user_id))
+    ) {
       throw new NotFoundException(`Voyage ${tripId} introuvable`);
     }
 
@@ -958,10 +978,15 @@ export class CommunityService {
       .lean()
       .exec();
 
+    const likes = Math.max(0, current?.likes || 0);
+    if (!liked && likes >= POPULAR_TRIP_LIKES && trip.user_id !== userId) {
+      this.rewardPopularTrip(trip.user_id, tripId);
+    }
+
     return {
       trip_id: tripId,
       liked: (current?.liked_by || []).includes(userId),
-      likes: Math.max(0, current?.likes || 0),
+      likes,
     };
   }
 
@@ -973,6 +998,9 @@ export class CommunityService {
     const circle = await this.circleModel.findOne({ id: post.circle_id }).lean().exec();
     if (circle) {
       await this.assertCircleAccess(circle, userId);
+    }
+    if (await isBlockedBetween(this.blockModel, userId, post.user_id)) {
+      throw new NotFoundException(`Post ${postId} introuvable`);
     }
 
     const liked = post.liked_by.includes(userId);
@@ -991,6 +1019,62 @@ export class CommunityService {
       liked: !liked,
       likes_count: post.likes_count,
     };
+  }
+
+  /** XP une seule fois par voyage, et badge « Populaire » au premier voyage concerné. */
+  private rewardPopularTrip(authorId: string, tripId: string) {
+    (async () => {
+      const awarded = await this.gamificationService.awardXpOnce(authorId, 'trip_popular', tripId);
+      if (awarded) await this.gamificationService.awardXP(authorId, 'populaire');
+    })().catch((err) => this.logger.warn(`XP voyage populaire non attribuée à ${authorId}: ${err.message}`));
+  }
+
+  // =========================================================================
+  // BLOCAGE ENTRE VOYAGEURS
+  // =========================================================================
+
+  async blockUser(userId: string, blockedId: string): Promise<object> {
+    if (userId === blockedId) {
+      throw new BadRequestException('Tu ne peux pas te bloquer toi-même');
+    }
+    const exists = await this.userModel.exists({ user_id: blockedId });
+    if (!exists) {
+      throw new NotFoundException('Voyageur introuvable');
+    }
+    await this.blockModel
+      .updateOne(
+        { blocker_id: userId, blocked_id: blockedId },
+        { $setOnInsert: { blocker_id: userId, blocked_id: blockedId } },
+        { upsert: true },
+      )
+      .exec();
+    return { blocked: true, user_id: blockedId };
+  }
+
+  async unblockUser(userId: string, blockedId: string): Promise<object> {
+    await this.blockModel.deleteOne({ blocker_id: userId, blocked_id: blockedId }).exec();
+    return { blocked: false, user_id: blockedId };
+  }
+
+  /** Voyageurs que j'ai bloqués (pour pouvoir les débloquer). */
+  async listBlockedUsers(userId: string): Promise<object[]> {
+    const blocks: any[] = await this.blockModel.find({ blocker_id: userId }).sort({ created_at: -1 }).lean().exec();
+    const users: any[] = await this.userModel
+      .find({ user_id: { $in: blocks.map((b) => b.blocked_id) } })
+      .lean()
+      .exec();
+    const userMap = new Map(users.map((u) => [u.user_id, u]));
+    return blocks.map((b) => {
+      const u = userMap.get(b.blocked_id);
+      return {
+        user_id: b.blocked_id,
+        name: u?.name || 'Voyageur',
+        pseudo: u?.pseudo || null,
+        avatar_emoji: u?.avatar_emoji || null,
+        picture: u?.picture || null,
+        blocked_at: b.created_at,
+      };
+    });
   }
 
   // =========================================================================

@@ -11,6 +11,7 @@ import { CommunityPost, CommunityPostSchema } from './schemas/community-post.sch
 import { CommunityComment, CommunityCommentSchema } from './schemas/community-comment.schema';
 import { CommunityReport, CommunityReportSchema } from './schemas/community-report.schema';
 import { CommunitySocialService } from './community-social.service';
+import { UserBlock, UserBlockSchema } from './schemas/user-block.schema';
 import { NotificationsModule } from '../notifications/notifications.module';
 import { SessionAuthGuard } from '../common/guards/session-auth.guard';
 import { TenancyModule } from '../tenancy/tenancy.module';
@@ -30,6 +31,7 @@ import { GLOBAL_DB_CONNECTION, TENANT_DB_CONNECTION } from '../common/constants'
         { name: CommunityPost.name, schema: CommunityPostSchema },
         { name: CommunityComment.name, schema: CommunityCommentSchema },
         { name: CommunityReport.name, schema: CommunityReportSchema },
+        { name: UserBlock.name, schema: UserBlockSchema },
       ],
       TENANT_DB_CONNECTION,
     ),

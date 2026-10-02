@@ -17,12 +17,43 @@ const XP_ACTIONS: Record<string, number> = {
   first_swipe: 1,
   review_place: 2,
   share_journal: 5,
+  // Engagement communautaire
+  comment: 1,
+  first_comment: 2,
+  trip_popular: 5,
+  populaire: 10,
+  trip_remixed: 3,
+  eclaireur: 10,
 };
 
 /** Actions attribuées uniquement par le serveur (jamais via POST /profile/xp). */
-export const SERVER_ONLY_XP_ACTIONS = ['review_place', 'share_journal'];
+export const SERVER_ONLY_XP_ACTIONS = [
+  'review_place',
+  'share_journal',
+  'comment',
+  'first_comment',
+  'trip_popular',
+  'populaire',
+  'trip_remixed',
+  'eclaireur',
+];
 
-const ONE_TIME_ACTIONS = ['first_swipe', 'first_trip', 'complete_profile', 'select_interests', 'thermal_setup'];
+const ONE_TIME_ACTIONS = [
+  'first_swipe',
+  'first_trip',
+  'complete_profile',
+  'select_interests',
+  'thermal_setup',
+  // Badges d'engagement (l'action porte le nom du badge)
+  'first_comment',
+  'populaire',
+  'eclaireur',
+];
+
+/** Nombre maximum d'attributions par jour (UTC) pour les actions répétables. */
+const DAILY_CAPS: Record<string, number> = {
+  comment: 5,
+};
 
 import { GLOBAL_DB_CONNECTION } from '../common/constants';
 
@@ -248,6 +279,28 @@ export class GamificationService {
       }
     }
 
+    // 5. Anti-triche : plafond quotidien (ex. 5 commentaires récompensés par jour)
+    const dailyCap = DAILY_CAPS[action];
+    const today = new Date().toISOString().slice(0, 10);
+    let dayCount = 1;
+    if (dailyCap !== undefined) {
+      const existing: any = await ActionModel.findOne({ user_id, action }).lean().exec();
+      if (existing?.day === today) {
+        if ((existing.day_count || 0) >= dailyCap) {
+          return {
+            user_id,
+            xp: profile.xp,
+            level: this.calculateLevel(profile.xp),
+            streak: profile.streak,
+            badges: profile.badges,
+            trips_count: profile.trips_count,
+            message: 'Daily XP cap reached for this action (anti-cheat)',
+          };
+        }
+        dayCount = (existing.day_count || 0) + 1;
+      }
+    }
+
     const newXp = profile.xp + xpAmount;
     const newLevel = this.calculateLevel(newXp);
 
@@ -282,6 +335,7 @@ export class GamificationService {
             xp: xpAmount,
             completed: true,
             completed_at: new Date(),
+            ...(dailyCap !== undefined ? { day: today, day_count: dayCount } : {}),
           },
           $inc: { count: 1 },
         },
@@ -536,6 +590,32 @@ export class GamificationService {
     };
   }
 
+  /**
+   * Attribue l'XP d'une action une seule fois pour une clé donnée
+   * (ex. un voyage qui atteint 10 likes, un voyageur qui refait un voyage).
+   * Renvoie null si la récompense a déjà été donnée.
+   */
+  async awardXpOnce(user_id: string, action: string, uniqueKey: string): Promise<object | null> {
+    const ActionModel = await this.tenancyService.getTenantModel<any>(user_id, 'UserXpAction', UserXpActionSchema);
+    // Marqueur posé atomiquement (index unique user_id + action) : pas de double attribution
+    const res = await ActionModel.updateOne(
+      { user_id, action: `${action}@${uniqueKey}` },
+      {
+        $setOnInsert: {
+          user_id,
+          tenant_id: user_id,
+          action: `${action}@${uniqueKey}`,
+          xp: 0,
+          completed: true,
+          completed_at: new Date(),
+        },
+      },
+      { upsert: true },
+    ).exec();
+    if (!res.upsertedCount) return null;
+    return this.awardXP(user_id, action);
+  }
+
   getBadges(): object[] {
     return [
       { id: 'first_swipe', title: 'Premier Swipe', description: "Tu as sélectionné tes premières envies de voyage", emoji: '👆', xp_reward: 10 },
@@ -543,6 +623,9 @@ export class GamificationService {
       { id: 'globe_trotter', title: 'Globe-trotter', description: '5 voyages générés', emoji: '🌍', xp_reward: 50 },
       { id: 'explorateur', title: 'Explorateur', description: '10 voyages générés', emoji: '🗺️', xp_reward: 100 },
       { id: 'en_feu', title: 'En Feu', description: '3 jours de streak', emoji: '🔥', xp_reward: 30 },
+      { id: 'first_comment', title: 'Bavard', description: 'Premier commentaire dans la communauté', emoji: '💬', xp_reward: 2 },
+      { id: 'populaire', title: 'Populaire', description: 'Un de tes voyages a reçu 10 likes', emoji: '❤️', xp_reward: 10 },
+      { id: 'eclaireur', title: 'Éclaireur', description: 'Un voyageur a refait ton voyage', emoji: '🧭', xp_reward: 10 },
       { id: 'voyago_pro', title: 'Voyago Pro', description: 'Membre Pro Voyago', emoji: '💎', xp_reward: 0 },
     ];
   }

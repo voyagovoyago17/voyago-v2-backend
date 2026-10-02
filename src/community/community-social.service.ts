@@ -18,6 +18,9 @@ import {
 } from './schemas/community-comment.schema';
 import { CommunityReport, CommunityReportDocument, ReportTargetType } from './schemas/community-report.schema';
 import { CreateCommentDto } from './dto/create-comment.dto';
+import { UserBlock, UserBlockDocument } from './schemas/user-block.schema';
+import { hiddenUserIds, isBlockedBetween } from './blocks';
+import { GamificationService } from '../gamification/gamification.service';
 
 /** Contenu commenté : son auteur et ceux qui peuvent modérer ses commentaires. */
 interface CommentTarget {
@@ -42,9 +45,11 @@ export class CommunitySocialService {
     @InjectModel(CommunityPost.name, TENANT_DB_CONNECTION) private readonly postModel: Model<CommunityPostDocument>,
     @InjectModel(CommunityComment.name, TENANT_DB_CONNECTION) private readonly commentModel: Model<CommunityCommentDocument>,
     @InjectModel(CommunityReport.name, TENANT_DB_CONNECTION) private readonly reportModel: Model<CommunityReportDocument>,
+    @InjectModel(UserBlock.name, TENANT_DB_CONNECTION) private readonly blockModel: Model<UserBlockDocument>,
     @InjectModel(User.name, GLOBAL_DB_CONNECTION) private readonly userModel: Model<UserDocument>,
     private readonly communityService: CommunityService,
     private readonly notificationsService: NotificationsService,
+    private readonly gamificationService: GamificationService,
   ) {}
 
   // =========================================================================
@@ -53,6 +58,15 @@ export class CommunitySocialService {
 
   /** Vérifie que `viewerId` peut voir le contenu (404 sinon) et renvoie qui le modère. */
   private async resolveTarget(type: CommentTargetType, id: string, viewerId?: string): Promise<CommentTarget> {
+    const target = await this.resolveVisibleTarget(type, id, viewerId);
+    // Contenu d'un voyageur bloqué (dans un sens ou dans l'autre) : inexistant pour le lecteur
+    if (await isBlockedBetween(this.blockModel, viewerId, target.ownerId)) {
+      throw new NotFoundException(type === 'trip' ? 'Voyage introuvable' : 'Publication introuvable');
+    }
+    return target;
+  }
+
+  private async resolveVisibleTarget(type: CommentTargetType, id: string, viewerId?: string): Promise<CommentTarget> {
     if (type === 'trip') {
       const trip: any = await this.sharedTripModel
         .findOne({ id })
@@ -134,8 +148,9 @@ export class CommunitySocialService {
     const viewerId = await this.communityService.authUserId(authHeader);
     const target = await this.resolveTarget(type, targetId, viewerId);
 
+    const hidden = await hiddenUserIds(this.blockModel, viewerId);
     const comments: any[] = await this.commentModel
-      .find({ target_type: type, target_id: targetId })
+      .find({ target_type: type, target_id: targetId, ...(hidden.length ? { user_id: { $nin: hidden } } : {}) })
       .sort({ created_at: 1 })
       .limit(500)
       .lean()
@@ -158,7 +173,7 @@ export class CommunitySocialService {
         .findOne({ id: dto.parent_id, target_type: dto.target_type, target_id: dto.target_id })
         .lean()
         .exec();
-      if (!parent) {
+      if (!parent || (await isBlockedBetween(this.blockModel, userId, parent.user_id))) {
         throw new NotFoundException('Commentaire introuvable');
       }
     }
@@ -172,6 +187,7 @@ export class CommunitySocialService {
       parent_id: parent ? parent.parent_id || parent.id : null,
     });
     await this.incrementCommentCount(dto.target_type, dto.target_id, 1);
+    this.rewardComment(userId);
 
     const authors = await this.authorsById([userId]);
     const author = authors.get(userId);
@@ -203,6 +219,14 @@ export class CommunitySocialService {
     }
 
     return this.toCommentDto(comment.toObject(), authors, userId, target);
+  }
+
+  /** XP d'engagement : 1 XP par commentaire (5 par jour max) et badge « Bavard » au premier. */
+  private rewardComment(userId: string) {
+    (async () => {
+      await this.gamificationService.awardXP(userId, 'comment');
+      await this.gamificationService.awardXP(userId, 'first_comment');
+    })().catch((err) => this.logger.warn(`XP commentaire non attribuée à ${userId}: ${err.message}`));
   }
 
   /** Supprime un commentaire (et ses réponses) : son auteur, l'auteur du contenu ou un modérateur du cercle. */

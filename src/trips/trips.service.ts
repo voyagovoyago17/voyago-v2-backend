@@ -19,6 +19,9 @@ import { TenancyService } from '../tenancy/tenancy.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { GLOBAL_DB_CONNECTION, TENANT_DB_CONNECTION } from '../common/constants';
 import { CommunityMember, CommunityMemberDocument } from '../community/schemas/community-member.schema';
+import { UserBlock, UserBlockDocument } from '../community/schemas/user-block.schema';
+import { isBlockedBetween } from '../community/blocks';
+import { GamificationService } from '../gamification/gamification.service';
 import {
   TripVisibility,
   canViewTrip,
@@ -36,6 +39,8 @@ export class TripsService {
     @InjectModel(Trip.name, TENANT_DB_CONNECTION) private readonly sharedTripModel: Model<TripDocument>,
     @InjectModel(User.name, GLOBAL_DB_CONNECTION) private readonly userModel: Model<UserDocument>,
     @InjectModel(CommunityMember.name, TENANT_DB_CONNECTION) private readonly memberModel: Model<CommunityMemberDocument>,
+    @InjectModel(UserBlock.name, TENANT_DB_CONNECTION) private readonly blockModel: Model<UserBlockDocument>,
+    private readonly gamificationService: GamificationService,
     private readonly aiService: AiService,
     private readonly tenancyService: TenancyService,
     private readonly notificationsService: NotificationsService,
@@ -94,6 +99,9 @@ export class TripsService {
 
     // L'auteur voit tout ; les autres voient les voyages publics, et ceux de la tribu s'ils partagent un cercle
     if (options.viewerId !== user_id) {
+      if (await isBlockedBetween(this.blockModel, options.viewerId, user_id)) {
+        return [];
+      }
       const isTribeMate = options.viewerId
         ? await sharesCircle(this.memberModel, options.viewerId, user_id)
         : false;
@@ -161,7 +169,11 @@ export class TripsService {
     if (!trip) {
       model = this.sharedTripModel;
       trip = await this.sharedTripModel.findOne({ id: trip_id }).exec();
-      if (trip && !(await canViewTrip(this.memberModel, trip, user_id))) {
+      if (
+        trip &&
+        (!(await canViewTrip(this.memberModel, trip, user_id)) ||
+          (await isBlockedBetween(this.blockModel, user_id, trip.user_id)))
+      ) {
         trip = null;
       }
     }
@@ -234,22 +246,8 @@ export class TripsService {
     }
   }
 
-  async generateTrip(user: UserDocument, dto: GenerateTripDto): Promise<Trip> {
-    const tenantId = user.user_id; // Multi-DB: tenant = user
-
-    // Get tenant-specific models
-    const TripModel = await this.tenancyService.getTenantModel<TripDocument>(
-      tenantId,
-      'Trip',
-      TripSchema,
-    );
-    const ProfileModel = await this.tenancyService.getTenantModel<any>(
-      tenantId,
-      'Profile',
-      ProfileSchema,
-    );
-
-    // Check freemium limit: 3 trips per month for non-pro users
+  /** Formule gratuite : 3 voyages créés par mois (générés ou refaits). */
+  private async assertFreemiumQuota(user: UserDocument, TripModel: Model<TripDocument>): Promise<void> {
     if (!user.is_pro) {
       const startOfMonth = new Date();
       startOfMonth.setDate(1);
@@ -271,6 +269,81 @@ export class TripsService {
         );
       }
     }
+  }
+
+  /** XP, compteur de voyages et badges après la création d'un voyage. */
+  private async rewardTripCreation(user: UserDocument, ProfileModel: Model<any>): Promise<void> {
+    const profile = await ProfileModel.findOne({ user_id: user.user_id }).exec();
+    if (profile) {
+      const isFirst = (profile.trips_count || 0) === 0;
+      const tripXp = isFirst ? 7 : 3;
+      const newXp = (profile.xp || 0) + tripXp;
+      const newLevel = Math.floor(newXp / 100) + 1;
+      const newTripsCount = (profile.trips_count || 0) + 1;
+
+      await ProfileModel.updateOne(
+        { user_id: user.user_id },
+        {
+          $set: {
+            xp: newXp,
+            level: newLevel,
+            trips_count: newTripsCount,
+            last_active: new Date(),
+            tenant_id: user.user_id,
+          },
+        },
+      ).exec();
+
+      // Enregistrer l'action dans user_xp_actions (anti-triche & cohérence de collection)
+      try {
+        const ActionModel = await this.tenancyService.getTenantModel<any>(
+          user.user_id,
+          'UserXpAction',
+          UserXpActionSchema,
+        );
+        const actionKey = isFirst ? 'first_trip' : 'generate_trip';
+        await ActionModel.findOneAndUpdate(
+          { user_id: user.user_id, action: actionKey },
+          {
+            $set: {
+              user_id: user.user_id,
+              tenant_id: user.user_id,
+              action: actionKey,
+              xp: tripXp,
+              completed: true,
+              completed_at: new Date(),
+            },
+            $inc: { count: 1 },
+          },
+          { upsert: true },
+        ).exec();
+      } catch (err: any) {
+        this.logger.warn(`Could not sync trip to user_xp_actions: ${err.message}`);
+      }
+
+      const updatedProfile = await ProfileModel.findOne({ user_id: user.user_id }).exec();
+      if (updatedProfile) {
+        await this.awardBadges(ProfileModel, updatedProfile);
+      }
+    }
+  }
+
+  async generateTrip(user: UserDocument, dto: GenerateTripDto): Promise<Trip> {
+    const tenantId = user.user_id; // Multi-DB: tenant = user
+
+    // Get tenant-specific models
+    const TripModel = await this.tenancyService.getTenantModel<TripDocument>(
+      tenantId,
+      'Trip',
+      TripSchema,
+    );
+    const ProfileModel = await this.tenancyService.getTenantModel<any>(
+      tenantId,
+      'Profile',
+      ProfileSchema,
+    );
+
+    await this.assertFreemiumQuota(user, TripModel);
 
     this.logger.log(`Generating trip for user ${user.user_id} (${user.name}) in ${dto.destination} [tenant: ${tenantId}]`);
 
@@ -364,59 +437,7 @@ export class TripsService {
     }
 
     // 5. Update profile in user's tenant DB: award XP, increment trips_count, check badges
-    const profile = await ProfileModel.findOne({ user_id: user.user_id }).exec();
-    if (profile) {
-      const isFirst = (profile.trips_count || 0) === 0;
-      const tripXp = isFirst ? 7 : 3;
-      const newXp = (profile.xp || 0) + tripXp;
-      const newLevel = Math.floor(newXp / 100) + 1;
-      const newTripsCount = (profile.trips_count || 0) + 1;
-
-      await ProfileModel.updateOne(
-        { user_id: user.user_id },
-        {
-          $set: {
-            xp: newXp,
-            level: newLevel,
-            trips_count: newTripsCount,
-            last_active: new Date(),
-            tenant_id: tenantId,
-          },
-        },
-      ).exec();
-
-      // Enregistrer l'action dans user_xp_actions (anti-triche & cohérence de collection)
-      try {
-        const ActionModel = await this.tenancyService.getTenantModel<any>(
-          user.user_id,
-          'UserXpAction',
-          UserXpActionSchema,
-        );
-        const actionKey = isFirst ? 'first_trip' : 'generate_trip';
-        await ActionModel.findOneAndUpdate(
-          { user_id: user.user_id, action: actionKey },
-          {
-            $set: {
-              user_id: user.user_id,
-              tenant_id: tenantId,
-              action: actionKey,
-              xp: tripXp,
-              completed: true,
-              completed_at: new Date(),
-            },
-            $inc: { count: 1 },
-          },
-          { upsert: true },
-        ).exec();
-      } catch (err: any) {
-        this.logger.warn(`Could not sync trip to user_xp_actions: ${err.message}`);
-      }
-
-      const updatedProfile = await ProfileModel.findOne({ user_id: user.user_id }).exec();
-      if (updatedProfile) {
-        await this.awardBadges(ProfileModel, updatedProfile);
-      }
-    }
+    await this.rewardTripCreation(user, ProfileModel);
 
     this.notificationsService.notifySafely(user.user_id, {
       type: 'trip_ready',
@@ -451,16 +472,108 @@ export class TripsService {
       await this.sharedTripModel.updateOne({ id: tripId }, { $set: visibilityFields(visibility) }).exec();
     } else {
       // Likes et commentaires ne vivent que sur la copie partagée : on ne les écrase pas
-      const { _id, __v, likes, liked_by, comments_count, ...mirror } = trip;
+      const { _id, __v, likes, liked_by, comments_count, remix_count, ...mirror } = trip;
       await this.sharedTripModel
         .updateOne(
           { id: tripId },
-          { $set: mirror, $setOnInsert: { likes: 0, liked_by: [], comments_count: 0 } },
+          { $set: mirror, $setOnInsert: { likes: 0, liked_by: [], comments_count: 0, remix_count: 0 } },
           { upsert: true },
         )
         .exec();
     }
 
     return { trip_id: tripId, ...visibilityFields(visibility) };
+  }
+
+  /**
+   * « Refaire ce voyage » : copie l'itinéraire d'un autre voyageur (visible par moi)
+   * dans mes voyages, en privé, avec mes dates et une météo recalculée.
+   */
+  async remixTrip(user: UserDocument, sourceTripId: string, startDate?: string): Promise<Trip> {
+    const source: any = await this.sharedTripModel.findOne({ id: sourceTripId }).lean().exec();
+    if (
+      !source ||
+      !(await canViewTrip(this.memberModel, source, user.user_id)) ||
+      (await isBlockedBetween(this.blockModel, user.user_id, source.user_id))
+    ) {
+      throw new NotFoundException(`Trip ${sourceTripId} not found`);
+    }
+    if (source.user_id === user.user_id) {
+      throw new HttpException('Ce voyage est déjà le tien', HttpStatus.BAD_REQUEST);
+    }
+
+    const TripModel = await this.tenancyService.getTenantModel<TripDocument>(user.user_id, 'Trip', TripSchema);
+    const ProfileModel = await this.tenancyService.getTenantModel<any>(user.user_id, 'Profile', ProfileSchema);
+    await this.assertFreemiumQuota(user, TripModel);
+
+    const days = Math.max(1, source.duration_days || 1);
+    let endDate: string | undefined;
+    if (startDate) {
+      const end = new Date(`${startDate.slice(0, 10)}T00:00:00Z`);
+      end.setUTCDate(end.getUTCDate() + days - 1);
+      endDate = end.toISOString().slice(0, 10);
+    }
+
+    // Les lieux sont repris tels quels ; seule la météo dépend des nouvelles dates
+    const pois = (source.pois || []).map((p: any) => ({ ...p }));
+    const firstValidPoi = pois.find((p: any) => p.lat && p.lng);
+    let weather = [];
+    try {
+      weather = await this.aiService.fetchWeather(
+        firstValidPoi?.lat ?? 48.8566,
+        firstValidPoi?.lng ?? 2.3522,
+        days,
+        startDate?.slice(0, 10),
+      );
+    } catch (err: any) {
+      this.logger.warn(`Météo indisponible pour le voyage refait: ${err.message}`);
+    }
+
+    const trip = await TripModel.create({
+      id: uuidv4(),
+      user_id: user.user_id,
+      tenant_id: user.user_id,
+      destination: source.destination,
+      city: source.city,
+      country: source.country,
+      country_code: source.country_code,
+      cover_image_url: source.cover_image_url,
+      start_date: startDate?.slice(0, 10),
+      end_date: endDate,
+      duration_days: days,
+      pace: source.pace,
+      transports: source.transports || [],
+      budget: source.budget,
+      interests: source.interests || [],
+      pois,
+      weather,
+      ...visibilityFields('private'),
+      likes: 0,
+      remixed_from: { trip_id: source.id, user_id: source.user_id, destination: source.destination },
+      created_at: new Date(),
+    });
+
+    await this.rewardTripCreation(user, ProfileModel);
+    await this.sharedTripModel.updateOne({ id: source.id }, { $inc: { remix_count: 1 } }).exec();
+    this.rewardRemixedAuthor(source.user_id, source.id, user);
+
+    return trip;
+  }
+
+  /** L'auteur d'origine : XP une fois par voyageur, badge « Éclaireur » et notification. */
+  private rewardRemixedAuthor(authorId: string, tripId: string, remixer: UserDocument) {
+    (async () => {
+      const awarded = await this.gamificationService.awardXpOnce(authorId, 'trip_remixed', `${tripId}:${remixer.user_id}`);
+      if (!awarded) return;
+      await this.gamificationService.awardXP(authorId, 'eclaireur');
+      const source: any = await this.sharedTripModel.findOne({ id: tripId }).select('destination').lean().exec();
+      this.notificationsService.notifySafely(authorId, {
+        type: 'trip_remixed',
+        title: `🧭 ${remixer.pseudo || remixer.name || 'Un voyageur'} refait ton voyage ${source?.destination ?? ''}`.trim(),
+        body: 'Ton itinéraire inspire la communauté !',
+        data: { trip_id: tripId },
+        dedupe_key: `trip_remixed:${tripId}:${remixer.user_id}`,
+      });
+    })().catch((err) => this.logger.warn(`Récompense « voyage refait » non attribuée à ${authorId}: ${err.message}`));
   }
 }
