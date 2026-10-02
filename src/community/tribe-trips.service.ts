@@ -1,4 +1,12 @@
-import { BadRequestException, ForbiddenException, Injectable, Logger, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ForbiddenException,
+  HttpException,
+  HttpStatus,
+  Injectable,
+  Logger,
+  NotFoundException,
+} from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import * as crypto from 'crypto';
@@ -19,8 +27,14 @@ import { isProActive } from '../pro/pro-status';
 /** Projets de voyage en cours de vote autorisés en même temps dans un cercle */
 const MAX_ACTIVE_PLANS_PER_CIRCLE = 3;
 
-/** Durée pendant laquelle les lieux générés pour une destination sont réutilisés */
-const CANDIDATES_CACHE_DAYS = 30;
+/** Ancienneté maximale d'un parcours réutilisable (« Parcours déjà connu ») */
+const REUSE_MAX_AGE_DAYS = 90;
+
+/** Voyages de tribu générés par l'IA par membre Pro et par mois */
+export const MAX_AI_PLANS_PER_MONTH = 4;
+
+/** Lieux proposés par jour : un peu plus que le rythme équilibré final pour laisser le choix */
+const CANDIDATES_PER_DAY_PACE = 'equilibre';
 
 /** Empreinte des paramètres qui influencent les lieux proposés par l'IA. */
 export function candidatesKey(destination: string, days: number, budget: string, interests: string[]): string {
@@ -215,11 +229,11 @@ export class TribeTripsService {
       ? dto.interests
       : CATEGORY_INTERESTS[circle.category] || ['culture', 'gastronomie', 'nature'];
 
-    // Plus de lieux que nécessaire (rythme intensif, un jour de plus) pour laisser le choix à la tribu
+    // Un jour de lieux en plus (4 par jour) pour laisser le choix à la tribu
     const candidateDto = {
       destination: dto.destination.trim(),
       duration_days: Math.min(dto.duration_days + 1, 8),
-      pace: 'intensif',
+      pace: CANDIDATES_PER_DAY_PACE,
       transports: ['marche'],
       budget,
       interests,
@@ -230,19 +244,27 @@ export class TribeTripsService {
     } as GenerateTripDto;
 
     const cacheKey = candidatesKey(candidateDto.destination, candidateDto.duration_days, budget, interests);
-    const cached: any = await this.planModel
-      .findOne({
-        candidates_key: cacheKey,
-        created_at: { $gte: new Date(Date.now() - CANDIDATES_CACHE_DAYS * 24 * 3600 * 1000) },
-      })
-      .sort({ created_at: -1 })
-      .select('candidates city country cover_image_url')
-      .lean()
-      .exec();
+    // « Parcours déjà connu » : lieux d'un voyage de tribu récent sur la même destination
+    const cached: any =
+      dto.mode === 'reuse'
+        ? await this.planModel
+            .findOne({
+              candidates_key: cacheKey,
+              created_at: { $gte: new Date(Date.now() - REUSE_MAX_AGE_DAYS * 24 * 3600 * 1000) },
+            })
+            .sort({ created_at: -1 })
+            .select('candidates city country cover_image_url')
+            .lean()
+            .exec()
+        : null;
 
     let places: { pois: any[]; city?: string; country?: string; monument: { imageUrl?: string } };
-    if (cached?.candidates?.length) {
-      this.logger.log(`Voyage de tribu ${candidateDto.destination} : lieux réutilisés (sans appel IA)`);
+    const aiGenerated = !cached?.candidates?.length;
+    if (aiGenerated) {
+      await this.assertAiPlanQuota(user.user_id);
+    }
+    if (!aiGenerated) {
+      this.logger.log(`Voyage de tribu ${candidateDto.destination} : parcours réutilisé (sans appel IA)`);
       places = {
         pois: cached.candidates.map(({ key, ...poi }: any) => poi),
         city: cached.city,
@@ -272,6 +294,7 @@ export class TribeTripsService {
       transports: ['marche'],
       interests,
       candidates_key: cacheKey,
+      ai_generated: aiGenerated,
       candidates: places.pois.map((p, i) => ({ ...p, key: `p${i}` })),
       status: 'voting',
     });
@@ -284,6 +307,27 @@ export class TribeTripsService {
     });
 
     return this.toDto(plan.toObject(), user.user_id, this.isManager(membership));
+  }
+
+  /** Plafond de voyages de tribu générés par l'IA, par membre et par mois civil (UTC). */
+  private async assertAiPlanQuota(userId: string): Promise<void> {
+    const now = new Date();
+    const startOfMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+    const used = await this.planModel
+      .countDocuments({ created_by: userId, ai_generated: { $ne: false }, created_at: { $gte: startOfMonth } })
+      .exec();
+    if (used >= MAX_AI_PLANS_PER_MONTH) {
+      throw new HttpException(
+        {
+          statusCode: HttpStatus.TOO_MANY_REQUESTS,
+          code: 'TRIBE_PLAN_QUOTA',
+          message:
+            `Tu as lancé ${MAX_AI_PLANS_PER_MONTH} nouveaux itinéraires de tribu ce mois-ci. ` +
+            'Choisis « Parcours déjà connu » ou attends le mois prochain.',
+        },
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+    }
   }
 
   async listPlans(circleId: string, authHeader?: string) {

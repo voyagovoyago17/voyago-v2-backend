@@ -55,6 +55,10 @@ export class CircleTripPlan {
   @Prop({ index: true })
   candidates_key?: string;
 
+  /** Lieux générés par l'IA pour ce projet (false = parcours réutilisé) : plafond mensuel */
+  @Prop({ default: true })
+  ai_generated: boolean;
+
   /** Lieux proposés au vote ; chacun porte une clé stable `key` */
   @Prop({ type: [Object], default: [] })
   candidates: any[];

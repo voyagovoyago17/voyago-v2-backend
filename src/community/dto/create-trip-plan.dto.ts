@@ -1,6 +1,15 @@
 import { ArrayMaxSize, IsArray, IsDateString, IsIn, IsInt, IsNotEmpty, IsOptional, IsString, Max, MaxLength, Min } from 'class-validator';
 
 export class CreateTripPlanDto {
+  /**
+   * fresh : nouvel itinéraire généré par l'IA (compte dans le plafond mensuel)
+   * reuse : parcours déjà connu pour cette destination, instantané et sans IA
+   *         (si aucun n'existe, un nouvel itinéraire est généré)
+   */
+  @IsOptional()
+  @IsIn(['fresh', 'reuse'])
+  mode?: 'fresh' | 'reuse';
+
   @IsString()
   @IsNotEmpty()
   @MaxLength(120)

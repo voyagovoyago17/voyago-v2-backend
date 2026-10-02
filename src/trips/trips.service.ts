@@ -23,6 +23,9 @@ import { UserBlock, UserBlockDocument } from '../community/schemas/user-block.sc
 import { isBlockedBetween } from '../community/blocks';
 import { GamificationService } from '../gamification/gamification.service';
 import { isProActive } from '../pro/pro-status';
+
+/** Voyages créés par mois avec la formule gratuite */
+export const FREE_TRIPS_PER_MONTH = 2;
 import {
   TripVisibility,
   canViewTrip,
@@ -247,7 +250,7 @@ export class TripsService {
     }
   }
 
-  /** Formule gratuite : 3 voyages créés par mois (générés ou refaits). */
+  /** Formule gratuite : FREE_TRIPS_PER_MONTH voyages créés par mois (générés, refaits ou de tribu). */
   private async assertFreemiumQuota(user: UserDocument, TripModel: Model<TripDocument>): Promise<void> {
     if (!isProActive(user)) {
       const startOfMonth = new Date();
@@ -259,11 +262,12 @@ export class TripsService {
         created_at: { $gte: startOfMonth },
       }).exec();
 
-      if (tripsThisMonth >= 3) {
+      if (tripsThisMonth >= FREE_TRIPS_PER_MONTH) {
         throw new HttpException(
           {
             statusCode: 402,
-            message: 'Free plan limit reached. Upgrade to Pro for unlimited trips.',
+            message: `Tu as atteint tes ${FREE_TRIPS_PER_MONTH} voyages gratuits du mois. Passe Pro pour des voyages illimités.`,
+            code: 'FREE_TRIP_QUOTA',
             error: 'Payment Required',
           },
           HttpStatus.PAYMENT_REQUIRED,
