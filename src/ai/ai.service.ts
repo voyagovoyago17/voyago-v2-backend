@@ -331,6 +331,17 @@ export class AiService {
       ? '4 km (15-20 min à vélo maximum entre deux étapes)'
       : '1,5 km (15-20 min à pied maximum entre deux étapes)';
     const dayEnd = activitiesPerDay === 5 ? '21h' : '19h';
+    // Voyage de tribu : les lieux sont présentés un par un au vote du groupe (swipe)
+    const tribeContext =
+      dto.purpose === 'tribe_vote'
+        ? `
+
+## CONTEXTE : VOTE DE TRIBU
+Ces lieux seront présentés un par un à un groupe de voyageurs qui votent d'un swipe (j'y vais / bof). Les lieux les mieux votés formeront l'itinéraire final.
+- ÉVENTAIL VARIÉ : mélange incontournables, pépites secrètes, adresses gourmandes, nature et panoramas, expériences à vivre ensemble, pour que chaque membre trouve ses coups de cœur.
+- DÉCISION EN 3 SECONDES : chaque "description" commence par ce qui rend le lieu unique, ton enthousiaste mais factuel, sans superlatifs vides ni formule générique.
+- ESPRIT DE GROUPE : privilégie des lieux qui se vivent bien à plusieurs (tables partagées, activités, panoramas) et accessibles à un groupe.`
+        : '';
 
     return `Tu es Voyago, guide local d'exception et expert en conception de voyages sur mesure.
 Conçois un itinéraire authentique, géographiquement optimisé et mémorable.
@@ -342,7 +353,7 @@ Conçois un itinéraire authentique, géographiquement optimisé et mémorable.
 - Rythme : ${paceDetails}
 - Déplacements : ${transports}
 - Budget : ${dto.budget} (adapte le standing des adresses)
-- Sensibilité thermique : ${this.getThermalSensitivityNote(dto.thermal_sensitivity)}
+- Sensibilité thermique : ${this.getThermalSensitivityNote(dto.thermal_sensitivity)}${tribeContext}
 
 ## RÈGLES
 1. VOLUME : exactement ${activitiesPerDay} lieux par jour, soit ${totalPoisCount} au total. Créneaux "order" : ${orderSlots}. Le lieu order 2 est un restaurant ou une adresse gourmande.

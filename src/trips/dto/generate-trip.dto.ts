@@ -60,6 +60,11 @@ export class GenerateTripDto {
   @IsIn(['cold', 'balanced', 'warm'])
   thermal_sensitivity?: string;
 
+  /** Usage des lieux générés : itinéraire classique (défaut) ou propositions soumises au vote d'une tribu */
+  @IsOptional()
+  @IsIn(['trip', 'tribe_vote'])
+  purpose?: 'trip' | 'tribe_vote';
+
   /** Visibilité du voyage (privé par défaut) */
   @IsOptional()
   @IsIn(['private', 'tribe', 'public'])

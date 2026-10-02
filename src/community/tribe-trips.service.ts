@@ -234,6 +234,7 @@ export class TribeTripsService {
       destination: dto.destination.trim(),
       duration_days: Math.min(dto.duration_days + 1, 8),
       pace: CANDIDATES_PER_DAY_PACE,
+      purpose: 'tribe_vote',
       transports: ['marche'],
       budget,
       interests,
