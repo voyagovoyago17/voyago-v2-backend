@@ -1,13 +1,31 @@
-import { Body, Controller, Get, Param, Post, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, HttpCode, Param, Post, Query, UseGuards } from '@nestjs/common';
 import { NotificationsService } from './notifications.service';
 import { SessionAuthGuard } from '../common/guards/session-auth.guard';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { ArrivalDto } from './dto/arrival.dto';
+import { RegisterDeviceDto, UnregisterDeviceDto } from './dto/register-device.dto';
+import { PushService } from './push/push.service';
 
 @Controller('notifications')
 @UseGuards(SessionAuthGuard)
 export class NotificationsController {
-  constructor(private readonly notificationsService: NotificationsService) {}
+  constructor(
+    private readonly notificationsService: NotificationsService,
+    private readonly pushService: PushService,
+  ) {}
+
+  /** Enregistre le jeton FCM de l'appareil (à chaque lancement et à chaque rotation du jeton). */
+  @Post('devices')
+  async registerDevice(@CurrentUser() user: any, @Body() dto: RegisterDeviceDto) {
+    return this.pushService.registerDevice(user.user_id, dto.token, dto.platform, dto.app_version);
+  }
+
+  /** Oublie l'appareil (déconnexion) : il ne reçoit plus les push de ce compte. */
+  @Delete('devices')
+  @HttpCode(200)
+  async unregisterDevice(@CurrentUser() user: any, @Body() dto: UnregisterDeviceDto) {
+    return this.pushService.unregisterDevice(user.user_id, dto.token);
+  }
 
   @Get()
   async list(@CurrentUser() user: any, @Query('limit') limit?: string) {

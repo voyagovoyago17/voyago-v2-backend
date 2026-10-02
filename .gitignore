@@ -24,3 +24,7 @@ Thumbs.db
 *.njsproj
 *.sln
 *.sw?
+
+# Clés Firebase (compte de service) : jamais dans le dépôt
+*firebase-adminsdk*.json
+secrets/

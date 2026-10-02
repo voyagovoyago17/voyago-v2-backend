@@ -6,6 +6,10 @@ import { Notification, NotificationDocument, NotificationType } from './schemas/
 import { ArrivalDto } from './dto/arrival.dto';
 import { placeKey } from '../places/place-key';
 import { GLOBAL_DB_CONNECTION } from '../common/constants';
+import { PushService } from './push/push.service';
+
+/** Types déjà affichés à l'écran par l'app au moment où ils naissent : pas de push en double. */
+const IN_APP_ONLY_TYPES: NotificationType[] = ['arrival'];
 
 export interface CreateNotificationInput {
   type: NotificationType;
@@ -22,6 +26,7 @@ export class NotificationsService {
   constructor(
     @InjectModel(Notification.name, GLOBAL_DB_CONNECTION)
     private readonly notificationModel: Model<NotificationDocument>,
+    private readonly pushService: PushService,
   ) {}
 
   /** Crée une notification ; avec dedupe_key, renvoie l'existante au lieu d'un doublon. */
@@ -45,7 +50,9 @@ export class NotificationsService {
         read: false,
         dedupe_key: input.dedupe_key,
       });
-      return this.toDto(doc.toObject());
+      const dto = this.toDto(doc.toObject());
+      this.pushSafely(userId, dto);
+      return dto;
     } catch (err: any) {
       // Course entre deux requêtes simultanées : l'index unique a gagné
       if (err?.code === 11000 && input.dedupe_key) {
@@ -64,6 +71,22 @@ export class NotificationsService {
     this.create(userId, input).catch((err) =>
       this.logger.warn(`Notification non créée pour ${userId}: ${err.message}`),
     );
+  }
+
+  /** Relaie une notification fraîchement créée en push FCM, sans jamais bloquer ni échouer. */
+  private pushSafely(userId: string, n: ReturnType<NotificationsService['toDto']>): void {
+    if (!this.pushService.enabled || IN_APP_ONLY_TYPES.includes(n.type)) return;
+    (async () => {
+      const { unread_count } = await this.unreadCount(userId);
+      await this.pushService.sendToUser(userId, {
+        title: n.title,
+        body: n.body,
+        badge: unread_count,
+        imageUrl: n.data?.image_url,
+        // L'app lit « payload » pour ouvrir le bon écran, comme depuis la cloche
+        data: { notification_id: n.id, type: n.type, payload: n.data },
+      });
+    })().catch((err) => this.logger.warn(`Push non envoyé à ${userId}: ${err.message}`));
   }
 
   async list(userId: string, limit = 30): Promise<{ notifications: any[]; unread_count: number }> {
