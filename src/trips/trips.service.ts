@@ -22,6 +22,7 @@ import { CommunityMember, CommunityMemberDocument } from '../community/schemas/c
 import { UserBlock, UserBlockDocument } from '../community/schemas/user-block.schema';
 import { isBlockedBetween } from '../community/blocks';
 import { GamificationService } from '../gamification/gamification.service';
+import { isProActive } from '../pro/pro-status';
 import {
   TripVisibility,
   canViewTrip,
@@ -248,7 +249,7 @@ export class TripsService {
 
   /** Formule gratuite : 3 voyages créés par mois (générés ou refaits). */
   private async assertFreemiumQuota(user: UserDocument, TripModel: Model<TripDocument>): Promise<void> {
-    if (!user.is_pro) {
+    if (!isProActive(user)) {
       const startOfMonth = new Date();
       startOfMonth.setDate(1);
       startOfMonth.setHours(0, 0, 0, 0);

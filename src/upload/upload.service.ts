@@ -1,3 +1,4 @@
+import { isProActive } from '../pro/pro-status';
 import {
   Injectable,
   Logger,
@@ -296,6 +297,7 @@ export class UploadService {
     delete obj.password_hash;
     delete obj._id;
     delete obj.__v;
+    obj.pro_active = isProActive(obj);
     return obj;
   }
 }

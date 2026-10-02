@@ -29,6 +29,7 @@ import { ResetPasswordDto } from './dto/reset-password.dto';
 import { UpdateProfileDto } from './dto/update-profile.dto';
 
 import { GLOBAL_DB_CONNECTION } from '../common/constants';
+import { isProActive } from '../pro/pro-status';
 import { TenancyService } from '../tenancy/tenancy.service';
 
 @Injectable()
@@ -102,6 +103,8 @@ export class AuthService {
     delete obj.password_hash;
     delete obj._id;
     delete obj.__v;
+    // Abonnement réellement valide (is_pro seul ne tient pas compte de l'échéance)
+    obj.pro_active = isProActive(obj);
     return obj;
   }
 

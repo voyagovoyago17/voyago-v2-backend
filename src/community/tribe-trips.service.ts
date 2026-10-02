@@ -14,9 +14,24 @@ import { CommunityMember, CommunityMemberDocument } from './schemas/community-me
 import { CircleTripPlan, CircleTripPlanDocument } from './schemas/circle-trip-plan.schema';
 import { CircleTripVote, CircleTripVoteDocument } from './schemas/circle-trip-vote.schema';
 import { CreateTripPlanDto } from './dto/create-trip-plan.dto';
+import { isProActive } from '../pro/pro-status';
 
 /** Projets de voyage en cours de vote autorisés en même temps dans un cercle */
 const MAX_ACTIVE_PLANS_PER_CIRCLE = 3;
+
+/** Durée pendant laquelle les lieux générés pour une destination sont réutilisés */
+const CANDIDATES_CACHE_DAYS = 30;
+
+/** Empreinte des paramètres qui influencent les lieux proposés par l'IA. */
+export function candidatesKey(destination: string, days: number, budget: string, interests: string[]): string {
+  const normalized = destination
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+  return [normalized, days, budget, [...interests].map((i) => i.toLowerCase()).sort().join(',')].join('|');
+}
 
 /** Centres d'intérêt par défaut selon la catégorie du cercle */
 const CATEGORY_INTERESTS: Record<string, string[]> = {
@@ -177,8 +192,14 @@ export class TribeTripsService {
   // CYCLE DE VIE D'UN VOYAGE DE TRIBU
   // =========================================================================
 
-  /** Un membre lance un voyage de tribu : l'IA propose des lieux à départager. */
+  /**
+   * Un membre Pro lance un voyage de tribu : l'IA propose des lieux à départager.
+   * Les lieux déjà générés pour la même destination (30 jours) sont réutilisés sans appel IA.
+   */
   async createPlan(user: UserDocument, circleId: string, dto: CreateTripPlanDto) {
+    if (!isProActive(user)) {
+      throw new ForbiddenException('Planifier un voyage de tribu est réservé aux membres Voyagooo Pro');
+    }
     const { circle, membership } = await this.memberCircle(circleId, user.user_id);
 
     const active = await this.planModel.countDocuments({ circle_id: circleId, status: 'voting' }).exec();
@@ -208,7 +229,29 @@ export class TribeTripsService {
       country_code: dto.country_code,
     } as GenerateTripDto;
 
-    const places = await this.tripsService.generatePlaces(candidateDto);
+    const cacheKey = candidatesKey(candidateDto.destination, candidateDto.duration_days, budget, interests);
+    const cached: any = await this.planModel
+      .findOne({
+        candidates_key: cacheKey,
+        created_at: { $gte: new Date(Date.now() - CANDIDATES_CACHE_DAYS * 24 * 3600 * 1000) },
+      })
+      .sort({ created_at: -1 })
+      .select('candidates city country cover_image_url')
+      .lean()
+      .exec();
+
+    let places: { pois: any[]; city?: string; country?: string; monument: { imageUrl?: string } };
+    if (cached?.candidates?.length) {
+      this.logger.log(`Voyage de tribu ${candidateDto.destination} : lieux réutilisés (sans appel IA)`);
+      places = {
+        pois: cached.candidates.map(({ key, ...poi }: any) => poi),
+        city: cached.city,
+        country: cached.country,
+        monument: { imageUrl: cached.cover_image_url },
+      };
+    } else {
+      places = await this.tripsService.generatePlaces(candidateDto);
+    }
     if (!places.pois.length) {
       throw new BadRequestException("L'IA n'a trouvé aucun lieu pour cette destination, réessaie");
     }
@@ -228,6 +271,7 @@ export class TribeTripsService {
       budget,
       transports: ['marche'],
       interests,
+      candidates_key: cacheKey,
       candidates: places.pois.map((p, i) => ({ ...p, key: `p${i}` })),
       status: 'voting',
     });

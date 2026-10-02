@@ -54,7 +54,10 @@ export class WebhooksService {
 
       case 'invoice.payment_succeeded': {
         const invoice = event.data.object as Stripe.Invoice;
-        // Handle subscription renewal if needed
+        // La première facture est déjà traitée par checkout.session.completed
+        if (invoice.billing_reason === 'subscription_cycle') {
+          await this.proService.renewFromInvoice(invoice);
+        }
         break;
       }
 

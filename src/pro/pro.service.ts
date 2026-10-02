@@ -109,6 +109,10 @@ export class ProService {
         tier,
         email: user.email || '',
       },
+      // Retrouvé sur chaque facture de renouvellement (invoice.subscription_details.metadata)
+      ...(isSubscription && {
+        subscription_data: { metadata: { user_id: user.user_id, tier } },
+      }),
       line_items: [
         {
           price_data: {
@@ -188,6 +192,42 @@ export class ProService {
       payment_status: updated.payment_status,
       applied: updated.applied,
     };
+  }
+
+  /**
+   * Renouvellement d'abonnement payé : prolonge l'échéance jusqu'à la fin de la
+   * période facturée. Les abonnements antérieurs sans métadonnées sont retrouvés par e-mail.
+   */
+  async renewFromInvoice(invoice: Stripe.Invoice): Promise<void> {
+    if (!invoice.subscription) return;
+    const metadata: Record<string, string> = (invoice as any).subscription_details?.metadata || {};
+    let userId = metadata.user_id;
+    if (!userId && invoice.customer_email) {
+      const user: any = await this.userModel.findOne({ email: invoice.customer_email.toLowerCase() }).lean().exec();
+      userId = user?.user_id;
+    }
+    if (!userId) {
+      this.logger.warn(`Renouvellement Stripe sans utilisateur identifiable (facture ${invoice.id})`);
+      return;
+    }
+
+    const periodEnd = invoice.lines?.data?.[0]?.period?.end;
+    let expiresAt: Date;
+    if (periodEnd) {
+      expiresAt = new Date(periodEnd * 1000);
+    } else {
+      expiresAt = new Date();
+      if (metadata.tier === 'annual') expiresAt.setFullYear(expiresAt.getFullYear() + 1);
+      else expiresAt.setMonth(expiresAt.getMonth() + 1);
+    }
+
+    await this.userModel
+      .updateOne(
+        { user_id: userId },
+        { $set: { is_pro: true, pro_expires_at: expiresAt, ...(metadata.tier ? { pro_tier: metadata.tier } : {}) } },
+      )
+      .exec();
+    this.logger.log(`Abonnement Pro de ${userId} prolongé jusqu'au ${expiresAt.toISOString()}`);
   }
 
   async applyProStatus(user_id: string, tier: string, session_id: string): Promise<void> {

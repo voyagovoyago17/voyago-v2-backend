@@ -51,6 +51,10 @@ export class CircleTripPlan {
   @Prop({ type: [String], default: [] })
   interests: string[];
 
+  /** Empreinte destination + paramètres : réutilise les lieux déjà générés (sans appel IA) */
+  @Prop({ index: true })
+  candidates_key?: string;
+
   /** Lieux proposés au vote ; chacun porte une clé stable `key` */
   @Prop({ type: [Object], default: [] })
   candidates: any[];
