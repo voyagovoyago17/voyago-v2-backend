@@ -87,6 +87,30 @@ export class NotificationsService {
     })().catch((err) => this.logger.warn(`Push non envoyé à ${userId}: ${err.message}`));
   }
 
+  /**
+   * Notification de test (cloche + push), envoyée tout de suite :
+   * renvoie le nombre d'appareils enregistrés et le résultat de l'envoi FCM.
+   */
+  async sendTest(userId: string) {
+    const doc = await this.notificationModel.create({
+      id: uuidv4(),
+      user_id: userId,
+      type: 'system',
+      title: '🔔 Notifications activées',
+      body: 'Tu recevras ici tes itinéraires prêts, commentaires et votes de tribu.',
+      data: { test: true },
+      read: false,
+    });
+    const n = this.toDto(doc.toObject());
+    const devices = await this.pushService.deviceCount(userId);
+    const push = await this.pushService.sendToUser(userId, {
+      title: n.title,
+      body: n.body,
+      data: { notification_id: n.id, type: n.type, payload: n.data },
+    });
+    return { notification: n, push_enabled: this.pushService.enabled, devices, ...push };
+  }
+
   async list(userId: string, limit = 30): Promise<{ notifications: any[]; unread_count: number }> {
     const safeLimit = Math.min(Math.max(limit || 30, 1), 100);
     const [items, unread] = await Promise.all([

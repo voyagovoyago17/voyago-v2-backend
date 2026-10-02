@@ -121,6 +121,10 @@ export class PushService implements OnModuleInit {
     return { removed: res.deletedCount > 0 };
   }
 
+  async deviceCount(userId: string): Promise<number> {
+    return this.deviceModel.countDocuments({ user_id: userId }).exec();
+  }
+
   /** Envoie une notification push à tous les appareils d'un utilisateur. Ne lève jamais d'erreur. */
   async sendToUser(userId: string, message: PushMessage): Promise<{ sent: number; failed: number }> {
     if (!this.messaging) return { sent: 0, failed: 0 };

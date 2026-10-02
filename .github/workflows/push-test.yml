@@ -1,0 +1,64 @@
+name: Test notifications push (FCM)
+
+# Lancé à la main depuis l'onglet Actions. Crée le compte de test s'il n'existe pas,
+# puis envoie une notification de test à tous les appareils connectés à ce compte.
+on:
+  workflow_dispatch:
+    inputs:
+      email:
+        description: "Compte de test"
+        required: true
+        default: 'test.push@voyagooo.com'
+      password:
+        description: "Mot de passe du compte de test"
+        required: true
+        default: 'azerty'
+
+jobs:
+  push-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Envoi depuis le serveur
+        uses: appleboy/ssh-action@v1
+        env:
+          TEST_EMAIL: ${{ inputs.email }}
+          TEST_PASSWORD: ${{ inputs.password }}
+        with:
+          host: ${{ secrets.VOYAGO_HOST }}
+          username: ${{ secrets.VOYAGO_USER }}
+          key: ${{ secrets.VOYAGO_SSH_KEY }}
+          port: ${{ secrets.VOYAGO_PORT || 22 }}
+          envs: TEST_EMAIL,TEST_PASSWORD
+          script: |
+            cd /var/www/voyago/backend
+            node - <<'JS'
+            const api = 'http://localhost:3333/api';
+            const { TEST_EMAIL: email, TEST_PASSWORD: password } = process.env;
+            const post = async (path, body, token) => {
+              const res = await fetch(api + path, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}) },
+                body: JSON.stringify(body || {}),
+              });
+              return { status: res.status, body: await res.json().catch(() => ({})) };
+            };
+            (async () => {
+              let auth = await post('/auth/email/login', { email, password });
+              if (auth.status >= 400) {
+                console.log('Compte absent : création de', email);
+                auth = await post('/auth/email/signup', { email, password, name: 'Testeur Push', pseudo: 'testeur_push' });
+              }
+              if (!auth.body.session_token) {
+                console.log('Connexion impossible :', auth.status, JSON.stringify(auth.body));
+                process.exit(1);
+              }
+              console.log('Connecté :', email, '(user_id', auth.body.user_id + ')');
+              const res = await post('/notifications/test', {}, auth.body.session_token);
+              const r = res.body;
+              console.log('FCM actif :', r.push_enabled, '| appareils enregistrés :', r.devices, '| envoyés :', r.sent, '| échecs :', r.failed);
+              if (!r.devices) console.log('→ Aucun appareil : connecte-toi avec ce compte dans l\'app (notifications acceptées), puis relance ce test.');
+              await fetch(api + '/auth/logout', { method: 'POST', headers: { Authorization: 'Bearer ' + auth.body.session_token } }).catch(() => {});
+            })();
+            JS
+            echo "--- Derniers logs push de l'API ---"
+            PATH="$HOME/.local/bin:$PATH" pm2 logs voyago-api --lines 300 --nostream 2>&1 | grep -iE "push|fcm" | tail -15 || true
