@@ -17,7 +17,7 @@ import { SessionAuthGuard } from '../common/guards/session-auth.guard';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { UserDocument } from '../auth/schemas/user.schema';
 
-@ApiTags('Upload')
+@ApiTags('📷 Médias & Uploads')
 @Controller('upload')
 export class UploadController {
   constructor(private readonly uploadService: UploadService) {}

@@ -7,6 +7,7 @@ import {
   Param,
   UseGuards,
 } from '@nestjs/common';
+import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
 import { TripsService } from './trips.service';
 import { SessionAuthGuard } from '../common/guards/session-auth.guard';
 import { OptionalSessionAuthGuard } from '../common/guards/optional-session-auth.guard';
@@ -17,6 +18,7 @@ import { RemixTripDto } from './dto/remix-trip.dto';
 import { CollectGemDto } from './dto/collect-gem.dto';
 import { TripGemsService } from './trip-gems.service';
 
+@ApiTags('✈️ Voyages & Itinéraires IA')
 @Controller()
 export class TripsController {
   constructor(
@@ -24,6 +26,8 @@ export class TripsController {
     private readonly tripGemsService: TripGemsService,
   ) {}
 
+  @ApiOperation({ summary: 'Obtenir tous les voyages d’un utilisateur (privés et/ou publics)' })
+  @ApiBearerAuth()
   @Get('trips/:user_id')
   @UseGuards(OptionalSessionAuthGuard)
   async getUserTrips(
@@ -34,6 +38,8 @@ export class TripsController {
     return this.tripsService.getUserTrips(user_id, { viewerId: user?.user_id });
   }
 
+  @ApiOperation({ summary: 'Obtenir le détail d’un voyage par son ID (avec POIs, météo et coordonnées)' })
+  @ApiBearerAuth()
   @Get('trip/:trip_id')
   @UseGuards(OptionalSessionAuthGuard)
   async getTrip(@Param('trip_id') trip_id: string, @CurrentUser() user: any) {
@@ -43,6 +49,8 @@ export class TripsController {
   }
 
   /** Rendre un voyage privé, visible par sa tribu ou public */
+  @ApiOperation({ summary: 'Modifier la visibilité d’un voyage (privé, tribu, public)' })
+  @ApiBearerAuth()
   @Patch('trip/:trip_id/visibility')
   @UseGuards(SessionAuthGuard)
   async updateVisibility(
@@ -54,6 +62,8 @@ export class TripsController {
   }
 
   /** « Refaire ce voyage » : copie un itinéraire visible dans mes voyages (privé) */
+  @ApiOperation({ summary: '« Refaire ce voyage » : cloner un itinéraire public dans mes voyages' })
+  @ApiBearerAuth()
   @Post('trip/:trip_id/remix')
   @UseGuards(SessionAuthGuard)
   async remixTrip(
@@ -66,6 +76,8 @@ export class TripsController {
 
   // Radar des pépites : lieux secrets à ramasser sur place pendant le voyage
 
+  @ApiOperation({ summary: 'Radar des pépites : lister les lieux secrets à collecter sur place' })
+  @ApiBearerAuth()
   @Get('trip/:trip_id/gems')
   @UseGuards(SessionAuthGuard)
   async getGems(@CurrentUser() user: any, @Param('trip_id') trip_id: string) {
@@ -73,12 +85,16 @@ export class TripsController {
   }
 
   /** Voyage sans dates : démarre le radar pour la durée du voyage */
+  @ApiOperation({ summary: 'Démarrer le radar des pépites pour un voyage sans dates fixées' })
+  @ApiBearerAuth()
   @Post('trip/:trip_id/gems/start')
   @UseGuards(SessionAuthGuard)
   async startGems(@CurrentUser() user: any, @Param('trip_id') trip_id: string) {
     return this.tripGemsService.start(user.user_id, trip_id);
   }
 
+  @ApiOperation({ summary: 'Collecter une pépite secrète avec validation GPS géolocalisée' })
+  @ApiBearerAuth()
   @Post('trip/:trip_id/gems/:gem_id/collect')
   @UseGuards(SessionAuthGuard)
   async collectGem(
@@ -90,6 +106,8 @@ export class TripsController {
     return this.tripGemsService.collect(user.user_id, trip_id, gem_id, dto.lat, dto.lng);
   }
 
+  @ApiOperation({ summary: 'Génération IA complète d’un voyage (Claude 3.5 Sonnet / Gemini Flash)' })
+  @ApiBearerAuth()
   @Post('trips/generate')
   @UseGuards(SessionAuthGuard)
   async generateTrip(

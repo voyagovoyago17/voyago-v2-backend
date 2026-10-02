@@ -6,12 +6,15 @@ import {
   HttpCode,
   HttpStatus,
 } from '@nestjs/common';
+import { ApiTags, ApiOperation } from '@nestjs/swagger';
 import { WebhooksService } from './webhooks.service';
 
+@ApiTags('⚡ Webhooks & Intégrations')
 @Controller('webhooks')
 export class WebhooksController {
   constructor(private readonly webhooksService: WebhooksService) {}
 
+  @ApiOperation({ summary: 'Réception et traitement des événements Stripe en temps réel' })
   @Post('stripe')
   @HttpCode(HttpStatus.OK)
   async stripeWebhook(

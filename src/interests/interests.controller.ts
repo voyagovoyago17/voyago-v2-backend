@@ -1,4 +1,5 @@
 import { Controller, Get } from '@nestjs/common';
+import { ApiTags, ApiOperation } from '@nestjs/swagger';
 
 const INTERESTS = [
   { id: 'culture', title: 'Culture & Histoire', emoji: '🏛️', description: 'Musées, monuments, sites historiques', image_url: null },
@@ -15,13 +16,17 @@ const INTERESTS = [
 
 @Controller()
 export class InterestsController {
+  @ApiTags('🎯 Intérêts & Découverte')
+  @ApiOperation({ summary: 'Liste de tous les centres d’intérêt pour le swipe Tinder de voyage' })
   @Get('interests')
   getInterests() {
     return INTERESTS;
   }
 
+  @ApiTags('🩺 Système & Santé')
+  @ApiOperation({ summary: 'Vérification de l’état de santé de l’API Voyagooo' })
   @Get()
   healthCheck() {
-    return { status: 'healthy', service: 'Voyago API', version: '2.0.0' };
+    return { status: 'healthy', service: 'Voyagooo API', version: '2.0.0' };
   }
 }

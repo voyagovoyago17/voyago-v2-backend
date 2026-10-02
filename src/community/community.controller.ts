@@ -24,7 +24,9 @@ import { TribeTripsService } from './tribe-trips.service';
 import { CircleChallengesService } from './circle-challenges.service';
 import { CreateTripPlanDto, JoinTripPlanDto, VoteTripPlanDto } from './dto/create-trip-plan.dto';
 import { COMMENT_TARGET_TYPES, CommentTargetType } from './schemas/community-comment.schema';
+import { ApiTags, ApiBearerAuth, ApiOperation } from '@nestjs/swagger';
 
+@ApiTags('👥 Communauté & Tribus')
 @Controller('community')
 export class CommunityController {
   constructor(
