@@ -28,15 +28,27 @@ jobs:
 
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1
+        env:
+          # Clé du compte de service Firebase (base64), facultative : sans elle, pas de push
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
         with:
           host: ${{ secrets.VOYAGO_HOST }}
           username: ${{ secrets.VOYAGO_USER }}
           key: ${{ secrets.VOYAGO_SSH_KEY }}
           port: ${{ secrets.VOYAGO_PORT || 22 }}
+          envs: FIREBASE_SERVICE_ACCOUNT
           script: |
             set -e
             cd /var/www/voyago/backend
             git pull origin main
+            # Synchronise la clé Firebase du secret GitHub vers le .env (sans jamais l'afficher)
+            if [ -n "$FIREBASE_SERVICE_ACCOUNT" ]; then
+              touch .env
+              grep -v '^FIREBASE_SERVICE_ACCOUNT=' .env > .env.tmp || true
+              printf 'FIREBASE_SERVICE_ACCOUNT=%s\n' "$FIREBASE_SERVICE_ACCOUNT" >> .env.tmp
+              chmod 600 .env.tmp && mv .env.tmp .env
+              echo "Clé Firebase synchronisée dans .env"
+            fi
             # Le build a besoin des dépendances de dev (@nestjs/cli, typescript) :
             # installation complète, build, puis retrait des dépendances de dev
             npm ci
