@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Resend } from 'resend';
 
@@ -13,7 +13,7 @@ function escapeHtml(value: string): string {
  * Expéditeur : MAIL_FROM (domaine à vérifier dans Resend).
  */
 @Injectable()
-export class MailService {
+export class MailService implements OnModuleInit {
   private readonly logger = new Logger(MailService.name);
   private readonly resend: Resend | null;
   private readonly from: string;
@@ -27,6 +27,35 @@ export class MailService {
     }
   }
 
+  /**
+   * Au démarrage : vérifie que le domaine de MAIL_FROM est validé dans Resend.
+   * Sans domaine vérifié, Resend refuse les envois : on le signale clairement dans les logs.
+   */
+  async onModuleInit() {
+    if (!this.resend) return;
+    const fromDomain = this.from.match(/@([^>\s]+)/)?.[1];
+    try {
+      const { data, error } = await this.resend.domains.list();
+      if (error) {
+        this.logger.error(`Resend : lecture des domaines impossible (${error.message}) : vérifie RESEND_API_KEY`);
+        return;
+      }
+      const list: any[] = Array.isArray(data) ? data : (data as any)?.data || [];
+      const match = list.find((d) => d.name === fromDomain || fromDomain?.endsWith(`.${d.name}`));
+      if (fromDomain === 'resend.dev') {
+        this.logger.warn("Resend : expéditeur de test resend.dev, envois limités à l'adresse du compte Resend");
+      } else if (!match) {
+        this.logger.error(`Resend : le domaine « ${fromDomain} » de MAIL_FROM n'est pas dans le compte : les e-mails seront refusés`);
+      } else if (match.status !== 'verified') {
+        this.logger.error(`Resend : le domaine « ${match.name} » est « ${match.status} » : termine sa vérification DNS`);
+      } else {
+        this.logger.log(`Resend prêt : expéditeur ${this.from}`);
+      }
+    } catch (err: any) {
+      this.logger.warn(`Resend : vérification du domaine impossible au démarrage (${err.message})`);
+    }
+  }
+
   /** Envoie un e-mail ; renvoie false en cas d'échec (jamais d'exception). */
   private async send(to: string, subject: string, html: string, text: string, devLog: string): Promise<boolean> {
     if (!this.resend) {
@@ -36,7 +65,9 @@ export class MailService {
     try {
       const { error } = await this.resend.emails.send({ from: this.from, to, subject, html, text });
       if (error) {
-        this.logger.error(`Resend a refusé l'e-mail « ${subject} » pour ${to} : ${error.message}`);
+        this.logger.error(
+          `Resend a refusé l'e-mail « ${subject} » pour ${to} (expéditeur ${this.from}) : ${error.name} – ${error.message}`,
+        );
         return false;
       }
       return true;
