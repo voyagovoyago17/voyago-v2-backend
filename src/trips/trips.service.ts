@@ -9,7 +9,7 @@ import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import { v4 as uuidv4 } from 'uuid';
 
-import { Trip, TripDocument, TripSchema } from './schemas/trip.schema';
+import { DayWeather, Trip, TripDocument, TripSchema } from './schemas/trip.schema';
 import { ProfileSchema } from '../gamification/schemas/profile.schema';
 import { UserXpActionSchema } from '../gamification/schemas/user-xp-action.schema';
 import { User, UserDocument } from '../auth/schemas/user.schema';
@@ -328,39 +328,26 @@ export class TripsService {
     }
   }
 
-  async generateTrip(user: UserDocument, dto: GenerateTripDto): Promise<Trip> {
-    const tenantId = user.user_id; // Multi-DB: tenant = user
-
-    // Get tenant-specific models
-    const TripModel = await this.tenancyService.getTenantModel<TripDocument>(
-      tenantId,
-      'Trip',
-      TripSchema,
-    );
-    const ProfileModel = await this.tenancyService.getTenantModel<any>(
-      tenantId,
-      'Profile',
-      ProfileSchema,
-    );
-
-    await this.assertFreemiumQuota(user, TripModel);
-
-    this.logger.log(`Generating trip for user ${user.user_id} (${user.name}) in ${dto.destination} [tenant: ${tenantId}]`);
-
-    // 1. Generate POIs with AI (Gemini or Claude with smart fallback)
-    const tripDto: GenerateTripDto = {
-      ...dto,
-      thermal_sensitivity: dto.thermal_sensitivity || user.thermal_sensitivity || 'balanced',
-    };
-    // 2. Résoudre le monument ou l'édifice emblématique du pays via IA & Wikimedia.
-    // Indépendant des POIs : lancé en parallèle de la génération pour ne pas
-    // additionner les deux latences IA.
+  /**
+   * Génère les lieux d'un voyage par IA, avec leurs photos (et la météo si demandé).
+   * Le premier lieu porte toujours le monument emblématique du pays.
+   */
+  async generatePlaces(
+    dto: GenerateTripDto,
+    options: { withWeather?: boolean } = {},
+  ): Promise<{
+    pois: any[];
+    weather: DayWeather[];
+    monument: { imageUrl: string };
+    city: string;
+    country?: string;
+  }> {
     const parts = dto.destination.split(',').map((s) => s.trim());
     const derivedCity = dto.city || (parts.length > 0 ? parts[0] : dto.destination);
     const derivedCountry = dto.country || (parts.length > 1 ? parts.slice(1).join(', ') : undefined);
 
     const [rawPois, monument] = await Promise.all([
-      this.aiService.generatePois(tripDto),
+      this.aiService.generatePois(dto),
       this.aiService.resolveCountryMonument(dto.destination, derivedCountry, derivedCity),
     ]);
 
@@ -395,8 +382,43 @@ export class TripsService {
           return { ...poi, image_url: imageUrl || monument.imageUrl };
         }),
       ),
-      this.aiService.fetchWeather(lat, lng, dto.duration_days, dto.start_date),
+      options.withWeather
+        ? this.aiService.fetchWeather(lat, lng, dto.duration_days, dto.start_date)
+        : Promise.resolve([] as DayWeather[]),
     ]);
+
+    return { pois: poisWithImages, weather, monument, city: derivedCity, country: derivedCountry };
+  }
+
+  async generateTrip(user: UserDocument, dto: GenerateTripDto): Promise<Trip> {
+    const tenantId = user.user_id; // Multi-DB: tenant = user
+
+    // Get tenant-specific models
+    const TripModel = await this.tenancyService.getTenantModel<TripDocument>(
+      tenantId,
+      'Trip',
+      TripSchema,
+    );
+    const ProfileModel = await this.tenancyService.getTenantModel<any>(
+      tenantId,
+      'Profile',
+      ProfileSchema,
+    );
+
+    await this.assertFreemiumQuota(user, TripModel);
+
+    this.logger.log(`Generating trip for user ${user.user_id} (${user.name}) in ${dto.destination} [tenant: ${tenantId}]`);
+
+    // 1. Generate POIs with AI (Gemini or Claude with smart fallback)
+    const tripDto: GenerateTripDto = {
+      ...dto,
+      thermal_sensitivity: dto.thermal_sensitivity || user.thermal_sensitivity || 'balanced',
+    };
+    // 2. Résoudre le monument ou l'édifice emblématique du pays via IA & Wikimedia.
+    // Indépendant des POIs : lancé en parallèle de la génération pour ne pas
+    // additionner les deux latences IA.
+    const { pois: poisWithImages, weather, monument, city: derivedCity, country: derivedCountry } =
+      await this.generatePlaces(tripDto, { withWeather: true });
 
     // 3. Create trip document in user's tenant DB
     const tripId = uuidv4();
@@ -502,58 +524,11 @@ export class TripsService {
       throw new HttpException('Ce voyage est déjà le tien', HttpStatus.BAD_REQUEST);
     }
 
-    const TripModel = await this.tenancyService.getTenantModel<TripDocument>(user.user_id, 'Trip', TripSchema);
-    const ProfileModel = await this.tenancyService.getTenantModel<any>(user.user_id, 'Profile', ProfileSchema);
-    await this.assertFreemiumQuota(user, TripModel);
-
-    const days = Math.max(1, source.duration_days || 1);
-    let endDate: string | undefined;
-    if (startDate) {
-      const end = new Date(`${startDate.slice(0, 10)}T00:00:00Z`);
-      end.setUTCDate(end.getUTCDate() + days - 1);
-      endDate = end.toISOString().slice(0, 10);
-    }
-
-    // Les lieux sont repris tels quels ; seule la météo dépend des nouvelles dates
-    const pois = (source.pois || []).map((p: any) => ({ ...p }));
-    const firstValidPoi = pois.find((p: any) => p.lat && p.lng);
-    let weather = [];
-    try {
-      weather = await this.aiService.fetchWeather(
-        firstValidPoi?.lat ?? 48.8566,
-        firstValidPoi?.lng ?? 2.3522,
-        days,
-        startDate?.slice(0, 10),
-      );
-    } catch (err: any) {
-      this.logger.warn(`Météo indisponible pour le voyage refait: ${err.message}`);
-    }
-
-    const trip = await TripModel.create({
-      id: uuidv4(),
-      user_id: user.user_id,
-      tenant_id: user.user_id,
-      destination: source.destination,
-      city: source.city,
-      country: source.country,
-      country_code: source.country_code,
-      cover_image_url: source.cover_image_url,
-      start_date: startDate?.slice(0, 10),
-      end_date: endDate,
-      duration_days: days,
-      pace: source.pace,
-      transports: source.transports || [],
-      budget: source.budget,
-      interests: source.interests || [],
-      pois,
-      weather,
-      ...visibilityFields('private'),
-      likes: 0,
-      remixed_from: { trip_id: source.id, user_id: source.user_id, destination: source.destination },
-      created_at: new Date(),
+    const trip = await this.createTripFromItinerary(user, source, {
+      startDate,
+      origin: { remixed_from: { trip_id: source.id, user_id: source.user_id, destination: source.destination } },
     });
 
-    await this.rewardTripCreation(user, ProfileModel);
     await this.sharedTripModel.updateOne({ id: source.id }, { $inc: { remix_count: 1 } }).exec();
     this.rewardRemixedAuthor(source.user_id, source.id, user);
 
@@ -575,5 +550,82 @@ export class TripsService {
         dedupe_key: `trip_remixed:${tripId}:${remixer.user_id}`,
       });
     })().catch((err) => this.logger.warn(`Récompense « voyage refait » non attribuée à ${authorId}: ${err.message}`));
+  }
+
+  /**
+   * Crée dans mes voyages (privé) un voyage à partir d'un itinéraire existant :
+   * voyage refait, voyage de tribu... Quota gratuit, XP et météo recalculée.
+   */
+  async createTripFromItinerary(
+    user: UserDocument,
+    itinerary: {
+      destination: string;
+      city?: string;
+      country?: string;
+      country_code?: string;
+      cover_image_url?: string;
+      duration_days?: number;
+      pace: string;
+      transports?: string[];
+      budget: string;
+      interests?: string[];
+      pois: any[];
+    },
+    options: { startDate?: string; origin?: Record<string, any> } = {},
+  ): Promise<Trip> {
+    const TripModel = await this.tenancyService.getTenantModel<TripDocument>(user.user_id, 'Trip', TripSchema);
+    const ProfileModel = await this.tenancyService.getTenantModel<any>(user.user_id, 'Profile', ProfileSchema);
+    await this.assertFreemiumQuota(user, TripModel);
+
+    const days = Math.max(1, itinerary.duration_days || 1);
+    const startDate = options.startDate?.slice(0, 10);
+    let endDate: string | undefined;
+    if (startDate) {
+      const end = new Date(`${startDate}T00:00:00Z`);
+      end.setUTCDate(end.getUTCDate() + days - 1);
+      endDate = end.toISOString().slice(0, 10);
+    }
+
+    // Les lieux sont repris tels quels ; seule la météo dépend des nouvelles dates
+    const pois = (itinerary.pois || []).map((p: any) => ({ ...p }));
+    const firstValidPoi = pois.find((p: any) => p.lat && p.lng);
+    let weather: DayWeather[] = [];
+    try {
+      weather = await this.aiService.fetchWeather(
+        firstValidPoi?.lat ?? 48.8566,
+        firstValidPoi?.lng ?? 2.3522,
+        days,
+        startDate,
+      );
+    } catch (err: any) {
+      this.logger.warn(`Météo indisponible pour le voyage copié: ${err.message}`);
+    }
+
+    const trip = await TripModel.create({
+      id: uuidv4(),
+      user_id: user.user_id,
+      tenant_id: user.user_id,
+      destination: itinerary.destination,
+      city: itinerary.city,
+      country: itinerary.country,
+      country_code: itinerary.country_code,
+      cover_image_url: itinerary.cover_image_url,
+      start_date: startDate,
+      end_date: endDate,
+      duration_days: days,
+      pace: itinerary.pace,
+      transports: itinerary.transports || [],
+      budget: itinerary.budget,
+      interests: itinerary.interests || [],
+      pois,
+      weather,
+      ...visibilityFields('private'),
+      likes: 0,
+      ...(options.origin || {}),
+      created_at: new Date(),
+    });
+
+    await this.rewardTripCreation(user, ProfileModel);
+    return trip;
   }
 }

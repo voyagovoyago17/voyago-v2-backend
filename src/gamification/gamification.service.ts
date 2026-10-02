@@ -24,6 +24,10 @@ const XP_ACTIONS: Record<string, number> = {
   populaire: 10,
   trip_remixed: 3,
   eclaireur: 10,
+  // Tribus
+  tribe_vote: 2,
+  circle_challenge: 10,
+  esprit_tribu: 15,
 };
 
 /** Actions attribuées uniquement par le serveur (jamais via POST /profile/xp). */
@@ -36,6 +40,9 @@ export const SERVER_ONLY_XP_ACTIONS = [
   'populaire',
   'trip_remixed',
   'eclaireur',
+  'tribe_vote',
+  'circle_challenge',
+  'esprit_tribu',
 ];
 
 const ONE_TIME_ACTIONS = [
@@ -48,6 +55,7 @@ const ONE_TIME_ACTIONS = [
   'first_comment',
   'populaire',
   'eclaireur',
+  'esprit_tribu',
 ];
 
 /** Nombre maximum d'attributions par jour (UTC) pour les actions répétables. */
@@ -626,6 +634,7 @@ export class GamificationService {
       { id: 'first_comment', title: 'Bavard', description: 'Premier commentaire dans la communauté', emoji: '💬', xp_reward: 2 },
       { id: 'populaire', title: 'Populaire', description: 'Un de tes voyages a reçu 10 likes', emoji: '❤️', xp_reward: 10 },
       { id: 'eclaireur', title: 'Éclaireur', description: 'Un voyageur a refait ton voyage', emoji: '🧭', xp_reward: 10 },
+      { id: 'esprit_tribu', title: 'Esprit de Tribu', description: 'Premier défi de cercle réussi avec ta tribu', emoji: '🏕️', xp_reward: 15 },
       { id: 'voyago_pro', title: 'Voyago Pro', description: 'Membre Pro Voyago', emoji: '💎', xp_reward: 0 },
     ];
   }

@@ -12,6 +12,15 @@ import { CommunityComment, CommunityCommentSchema } from './schemas/community-co
 import { CommunityReport, CommunityReportSchema } from './schemas/community-report.schema';
 import { CommunitySocialService } from './community-social.service';
 import { UserBlock, UserBlockSchema } from './schemas/user-block.schema';
+import { CircleTripPlan, CircleTripPlanSchema } from './schemas/circle-trip-plan.schema';
+import { CircleTripVote, CircleTripVoteSchema } from './schemas/circle-trip-vote.schema';
+import {
+  CircleChallengeCompletion,
+  CircleChallengeCompletionSchema,
+} from './schemas/circle-challenge-completion.schema';
+import { PlaceReview, PlaceReviewSchema } from '../places/schemas/place-review.schema';
+import { TribeTripsService } from './tribe-trips.service';
+import { CircleChallengesService } from './circle-challenges.service';
 import { NotificationsModule } from '../notifications/notifications.module';
 import { SessionAuthGuard } from '../common/guards/session-auth.guard';
 import { TenancyModule } from '../tenancy/tenancy.module';
@@ -32,6 +41,9 @@ import { GLOBAL_DB_CONNECTION, TENANT_DB_CONNECTION } from '../common/constants'
         { name: CommunityComment.name, schema: CommunityCommentSchema },
         { name: CommunityReport.name, schema: CommunityReportSchema },
         { name: UserBlock.name, schema: UserBlockSchema },
+        { name: CircleTripPlan.name, schema: CircleTripPlanSchema },
+        { name: CircleTripVote.name, schema: CircleTripVoteSchema },
+        { name: CircleChallengeCompletion.name, schema: CircleChallengeCompletionSchema },
       ],
       TENANT_DB_CONNECTION,
     ),
@@ -39,6 +51,8 @@ import { GLOBAL_DB_CONNECTION, TENANT_DB_CONNECTION } from '../common/constants'
       [
         { name: User.name, schema: UserSchema },
         { name: UserSession.name, schema: UserSessionSchema },
+        // Avis de lieux : défi « Explorer le terrain »
+        { name: PlaceReview.name, schema: PlaceReviewSchema },
       ],
       GLOBAL_DB_CONNECTION,
     ),
@@ -48,7 +62,7 @@ import { GLOBAL_DB_CONNECTION, TENANT_DB_CONNECTION } from '../common/constants'
     NotificationsModule,
   ],
   controllers: [CommunityController],
-  providers: [CommunityService, CommunitySocialService, SessionAuthGuard],
+  providers: [CommunityService, CommunitySocialService, TribeTripsService, CircleChallengesService, SessionAuthGuard],
   exports: [CommunityService],
 })
 export class CommunityModule {}

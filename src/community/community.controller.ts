@@ -20,6 +20,9 @@ import { JoinCircleByCodeDto } from './dto/join-by-code.dto';
 import { CreateCommentDto } from './dto/create-comment.dto';
 import { ReportContentDto } from './dto/report.dto';
 import { CommunitySocialService } from './community-social.service';
+import { TribeTripsService } from './tribe-trips.service';
+import { CircleChallengesService } from './circle-challenges.service';
+import { CreateTripPlanDto, JoinTripPlanDto, VoteTripPlanDto } from './dto/create-trip-plan.dto';
 import { COMMENT_TARGET_TYPES, CommentTargetType } from './schemas/community-comment.schema';
 
 @Controller('community')
@@ -27,6 +30,8 @@ export class CommunityController {
   constructor(
     private readonly communityService: CommunityService,
     private readonly socialService: CommunitySocialService,
+    private readonly tribeTripsService: TribeTripsService,
+    private readonly challengesService: CircleChallengesService,
   ) {}
 
   // =========================================================================
@@ -241,6 +246,52 @@ export class CommunityController {
   @UseGuards(SessionAuthGuard)
   async report(@CurrentUser() user: any, @Body() dto: ReportContentDto) {
     return this.socialService.report(user.user_id, dto.target_type, dto.target_id, dto.reason);
+  }
+
+  // =========================================================================
+  // 5. VOYAGES DE TRIBU & DÉFIS DE CERCLE
+  // =========================================================================
+
+  /** Défis du mois de la tribu et progression */
+  @Get('circles/:id/challenges')
+  async getChallenges(@Param('id') id: string, @Headers('authorization') authHeader?: string) {
+    return this.challengesService.getChallenges(id, authHeader);
+  }
+
+  @Get('circles/:id/trip-plans')
+  async listTripPlans(@Param('id') id: string, @Headers('authorization') authHeader?: string) {
+    return this.tribeTripsService.listPlans(id, authHeader);
+  }
+
+  /** Lancer un voyage de tribu : l'IA propose des lieux soumis au vote des membres */
+  @Post('circles/:id/trip-plans')
+  @UseGuards(SessionAuthGuard)
+  async createTripPlan(@CurrentUser() user: any, @Param('id') id: string, @Body() dto: CreateTripPlanDto) {
+    return this.tribeTripsService.createPlan(user, id, dto);
+  }
+
+  @Get('trip-plans/:planId')
+  async getTripPlan(@Param('planId') planId: string, @Headers('authorization') authHeader?: string) {
+    return this.tribeTripsService.getPlan(planId, authHeader);
+  }
+
+  @Post('trip-plans/:planId/votes')
+  @UseGuards(SessionAuthGuard)
+  async voteTripPlan(@CurrentUser() user: any, @Param('planId') planId: string, @Body() dto: VoteTripPlanDto) {
+    return this.tribeTripsService.vote(user.user_id, planId, dto.poi_key, dto.vote);
+  }
+
+  @Post('trip-plans/:planId/finalize')
+  @UseGuards(SessionAuthGuard)
+  async finalizeTripPlan(@CurrentUser() user: any, @Param('planId') planId: string) {
+    return this.tribeTripsService.finalize(user.user_id, planId);
+  }
+
+  /** Ajouter le voyage de tribu finalisé à mes voyages */
+  @Post('trip-plans/:planId/join')
+  @UseGuards(SessionAuthGuard)
+  async joinTripPlan(@CurrentUser() user: any, @Param('planId') planId: string, @Body() dto: JoinTripPlanDto) {
+    return this.tribeTripsService.join(user, planId, dto.start_date);
   }
 
   @Post('posts/:id/like')
