@@ -23,6 +23,7 @@ import { UserBlock, UserBlockDocument } from '../community/schemas/user-block.sc
 import { isBlockedBetween } from '../community/blocks';
 import { GamificationService } from '../gamification/gamification.service';
 import { isProActive } from '../pro/pro-status';
+import { TripGem } from '../ai/ai.service';
 
 /** Voyages créés par mois avec la formule gratuite */
 export const FREE_TRIPS_PER_MONTH = 2;
@@ -346,13 +347,14 @@ export class TripsService {
     monument: { imageUrl: string };
     city: string;
     country?: string;
+    gems: TripGem[];
   }> {
     const parts = dto.destination.split(',').map((s) => s.trim());
     const derivedCity = dto.city || (parts.length > 0 ? parts[0] : dto.destination);
     const derivedCountry = dto.country || (parts.length > 1 ? parts.slice(1).join(', ') : undefined);
 
-    const [rawPois, monument] = await Promise.all([
-      this.aiService.generatePois(dto),
+    const [{ pois: rawPois, gems: rawGems }, monument] = await Promise.all([
+      this.aiService.generatePoisAndGems(dto),
       this.aiService.resolveCountryMonument(dto.destination, derivedCountry, derivedCity),
     ]);
 
@@ -392,7 +394,15 @@ export class TripsService {
         : Promise.resolve([] as DayWeather[]),
     ]);
 
-    return { pois: poisWithImages, weather, monument, city: derivedCity, country: derivedCountry };
+    // Photos des pépites (Wikimedia, gratuit) en parallèle, sans bloquer si une échoue
+    const gems = await Promise.all(
+      rawGems.map(async (g) => ({
+        ...g,
+        image_url: await this.aiService.fetchWikipediaImage(g.image_query, undefined).catch(() => null),
+      })),
+    );
+
+    return { pois: poisWithImages, weather, monument, city: derivedCity, country: derivedCountry, gems };
   }
 
   async generateTrip(user: UserDocument, dto: GenerateTripDto): Promise<Trip> {
@@ -422,7 +432,7 @@ export class TripsService {
     // 2. Résoudre le monument ou l'édifice emblématique du pays via IA & Wikimedia.
     // Indépendant des POIs : lancé en parallèle de la génération pour ne pas
     // additionner les deux latences IA.
-    const { pois: poisWithImages, weather, monument, city: derivedCity, country: derivedCountry } =
+    const { pois: poisWithImages, weather, monument, city: derivedCity, country: derivedCountry, gems } =
       await this.generatePlaces(tripDto, { withWeather: true });
 
     // 3. Create trip document in user's tenant DB
@@ -447,6 +457,7 @@ export class TripsService {
       interests: dto.interests,
       pois: poisWithImages,
       weather,
+      gems,
       ...visibilityFields(visibility),
       likes: 0,
       created_at: new Date(),
@@ -575,6 +586,8 @@ export class TripsService {
       budget: string;
       interests?: string[];
       pois: any[];
+      /** Pépites du voyage d'origine (reprises non ramassées) */
+      gems?: any[];
     },
     options: { startDate?: string; origin?: Record<string, any> } = {},
   ): Promise<Trip> {
@@ -624,6 +637,7 @@ export class TripsService {
       interests: itinerary.interests || [],
       pois,
       weather,
+      gems: (itinerary.gems || []).map((g: any) => ({ ...g, collected_at: null })),
       ...visibilityFields('private'),
       likes: 0,
       ...(options.origin || {}),

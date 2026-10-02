@@ -23,6 +23,8 @@ import { CircleTripPlan, CircleTripPlanDocument } from './schemas/circle-trip-pl
 import { CircleTripVote, CircleTripVoteDocument } from './schemas/circle-trip-vote.schema';
 import { CreateTripPlanDto } from './dto/create-trip-plan.dto';
 import { isProActive } from '../pro/pro-status';
+import { expectedGemCount } from '../ai/ai.service';
+import { distanceMeters } from '../trips/trip-gems.service';
 
 /** Projets de voyage en cours de vote autorisés en même temps dans un cercle */
 const MAX_ACTIVE_PLANS_PER_CIRCLE = 3;
@@ -437,6 +439,7 @@ export class TribeTripsService {
         budget: plan.budget,
         interests: plan.interests,
         pois: plan.final_pois.map(({ key, tribe_votes, ...poi }: any) => poi),
+        gems: await this.gemsFromSkippedPlaces(plan),
       },
       {
         startDate: startDate || plan.start_date,
@@ -445,6 +448,46 @@ export class TribeTripsService {
     );
     await this.planModel.updateOne({ id: planId }, { $addToSet: { joined_by: user.user_id } }).exec();
     return trip;
+  }
+
+  /**
+   * Pépites du voyage de tribu, sans appel IA : les lieux proposés mais non retenus
+   * (les plus appréciés d'abord), chacun rattaché au jour dont il est le plus proche.
+   */
+  private async gemsFromSkippedPlaces(plan: any): Promise<any[]> {
+    const kept = new Set(plan.final_pois.map((p: any) => p.key));
+    const { byKey } = await this.tallies(plan.id);
+    const skipped = plan.candidates
+      .filter((c: any) => !kept.has(c.key) && c.lat && c.lng)
+      .map((c: any) => ({ c, up: byKey.get(c.key)?.up || 0 }))
+      .sort((a: any, b: any) => b.up - a.up)
+      .slice(0, expectedGemCount(plan.duration_days));
+
+    return skipped.map(({ c, up }: any, i: number) => {
+      let day = 1;
+      let best = Infinity;
+      for (const p of plan.final_pois) {
+        const d = distanceMeters(c.lat, c.lng, p.lat, p.lng);
+        if (d < best) {
+          best = d;
+          day = p.day;
+        }
+      }
+      const firstSentence = (c.description || '').split(/(?<=[.!?])\s/)[0];
+      return {
+        id: `g${i}`,
+        name: c.name,
+        teaser: c.insider_tip || firstSentence || 'Un lieu repéré par ta tribu.',
+        lat: c.lat,
+        lng: c.lng,
+        day,
+        category: c.category || 'pépite',
+        rarity: up >= 2 ? 'rare' : 'commune',
+        image_query: c.image_query || c.name,
+        image_url: c.image_url || null,
+        collected_at: null,
+      };
+    });
   }
 
   private notifyMembers(

@@ -28,6 +28,11 @@ const XP_ACTIONS: Record<string, number> = {
   tribe_vote: 2,
   circle_challenge: 10,
   esprit_tribu: 15,
+  // Radar des pépites (XP selon la rareté)
+  gem_commune: 5,
+  gem_rare: 10,
+  gem_legendaire: 20,
+  chasseur_pepites: 5,
 };
 
 /** Actions attribuées uniquement par le serveur (jamais via POST /profile/xp). */
@@ -43,6 +48,10 @@ export const SERVER_ONLY_XP_ACTIONS = [
   'tribe_vote',
   'circle_challenge',
   'esprit_tribu',
+  'gem_commune',
+  'gem_rare',
+  'gem_legendaire',
+  'chasseur_pepites',
 ];
 
 const ONE_TIME_ACTIONS = [
@@ -56,6 +65,7 @@ const ONE_TIME_ACTIONS = [
   'populaire',
   'eclaireur',
   'esprit_tribu',
+  'chasseur_pepites',
 ];
 
 /** Nombre maximum d'attributions par jour (UTC) pour les actions répétables. */
@@ -634,6 +644,7 @@ export class GamificationService {
       { id: 'first_comment', title: 'Bavard', description: 'Premier commentaire dans la communauté', emoji: '💬', xp_reward: 2 },
       { id: 'populaire', title: 'Populaire', description: 'Un de tes voyages a reçu 10 likes', emoji: '❤️', xp_reward: 10 },
       { id: 'eclaireur', title: 'Éclaireur', description: 'Un voyageur a refait ton voyage', emoji: '🧭', xp_reward: 10 },
+      { id: 'chasseur_pepites', title: 'Chasseur de Pépites', description: 'Première pépite ramassée sur le terrain', emoji: '💎', xp_reward: 5 },
       { id: 'esprit_tribu', title: 'Esprit de Tribu', description: 'Premier défi de cercle réussi avec ta tribu', emoji: '🏕️', xp_reward: 15 },
       { id: 'voyago_pro', title: 'Voyago Pro', description: 'Membre Pro Voyago', emoji: '💎', xp_reward: 0 },
     ];

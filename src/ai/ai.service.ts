@@ -27,13 +27,53 @@ const POI_RESPONSE_SCHEMA: ResponseSchema = {
   required: ['name', 'description', 'lat', 'lng', 'day', 'order', 'category', 'image_query', 'insider_tip'],
 };
 
+/** Pépite à collectionner : lieu secret hors itinéraire, qui motive un détour (radar). */
+const GEM_RESPONSE_SCHEMA: ResponseSchema = {
+  type: SchemaType.OBJECT,
+  properties: {
+    name: { type: SchemaType.STRING },
+    teaser: { type: SchemaType.STRING },
+    lat: { type: SchemaType.NUMBER },
+    lng: { type: SchemaType.NUMBER },
+    day: { type: SchemaType.INTEGER },
+    category: { type: SchemaType.STRING },
+    rarity: { type: SchemaType.STRING },
+    image_query: { type: SchemaType.STRING },
+  },
+  required: ['name', 'teaser', 'lat', 'lng', 'day', 'rarity'],
+};
+
 const TRIP_POIS_RESPONSE_SCHEMA: ResponseSchema = {
   type: SchemaType.OBJECT,
   properties: {
     pois: { type: SchemaType.ARRAY, items: POI_RESPONSE_SCHEMA },
+    gems: { type: SchemaType.ARRAY, items: GEM_RESPONSE_SCHEMA },
   },
   required: ['pois'],
 };
+
+/** Raretés des pépites (l'XP correspondante est fixée par le serveur, jamais par l'IA). */
+export const GEM_RARITIES = ['commune', 'rare', 'legendaire'] as const;
+export type GemRarity = (typeof GEM_RARITIES)[number];
+
+export interface TripGem {
+  id: string;
+  name: string;
+  teaser: string;
+  lat: number;
+  lng: number;
+  day: number;
+  category: string;
+  rarity: GemRarity;
+  image_query: string;
+  image_url?: string | null;
+  collected_at?: Date | null;
+}
+
+/** Nombre de pépites demandées : une par jour, 10 au maximum. */
+export function expectedGemCount(durationDays: number): number {
+  return Math.min(Math.max(durationDays, 1), 10);
+}
 
 /**
  * Cascade Claude (identifiants actuels, sans suffixe de date).
@@ -48,12 +88,32 @@ const CLAUDE_MODELS: { id: string; effort?: 'low' | 'medium' | 'high'; extraToke
 
 /** Estimation de la sortie : ~350 tokens par lieu (description + astuce en français) + marge. */
 const TOKENS_PER_POI = 350;
+/** ~120 tokens par pépite (nom, accroche, coordonnées) */
+const TOKENS_PER_GEM = 120;
 const CLAUDE_MAX_OUTPUT = 64000;
 
 /** Schéma imposé à Claude (structured outputs) : JSON toujours valide et complet. */
 const POIS_JSON_SCHEMA = {
   type: 'object',
   properties: {
+    gems: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          name: { type: 'string' },
+          teaser: { type: 'string' },
+          lat: { type: 'number' },
+          lng: { type: 'number' },
+          day: { type: 'integer' },
+          category: { type: 'string' },
+          rarity: { type: 'string', enum: ['commune', 'rare', 'legendaire'] },
+          image_query: { type: 'string' },
+        },
+        required: ['name', 'teaser', 'lat', 'lng', 'day', 'category', 'rarity', 'image_query'],
+        additionalProperties: false,
+      },
+    },
     pois: {
       type: 'array',
       items: {
@@ -81,7 +141,7 @@ const POIS_JSON_SCHEMA = {
       },
     },
   },
-  required: ['pois'],
+  required: ['pois', 'gems'],
   additionalProperties: false,
 };
 
@@ -175,6 +235,14 @@ export class AiService {
   }
 
   async generatePois(dto: GenerateTripDto): Promise<POI[]> {
+    return (await this.generatePoisAndGems(dto)).pois;
+  }
+
+  /**
+   * Lieux de l'itinéraire et, pour un voyage classique, pépites à collectionner
+   * (même appel IA : aucun coût supplémentaire). Les pépites peuvent être vides.
+   */
+  async generatePoisAndGems(dto: GenerateTripDto): Promise<{ pois: POI[]; gems: TripGem[] }> {
     // 1. Claude, uniquement si AI_PROVIDER=claude (client non créé sinon)
     if (this.anthropic) {
       try {
@@ -193,8 +261,55 @@ export class AiService {
       }
     }
 
-    // 3. Fallback to dynamic real-venue generation
-    return await this.generateDynamicPois(dto);
+    // 3. Fallback to dynamic real-venue generation (sans pépites)
+    return { pois: await this.generateDynamicPois(dto), gems: [] };
+  }
+
+  /** Les pépites ne sont demandées que pour un voyage classique (pas pour un vote de tribu). */
+  private wantsGems(dto: GenerateTripDto): boolean {
+    return dto.purpose !== 'tribe_vote';
+  }
+
+  /**
+   * Garde les pépites exploitables : coordonnées réelles proches de la destination,
+   * pas de doublon avec un lieu de l'itinéraire, rareté connue, 1 légendaire maximum.
+   */
+  private sanitizeGems(rawGems: any[], pois: POI[], dto: GenerateTripDto): TripGem[] {
+    if (!Array.isArray(rawGems) || !this.wantsGems(dto)) return [];
+    const poiNames = new Set(pois.map((p) => p.name.trim().toLowerCase()));
+    const ref = pois.find((p) => p.lat && p.lng);
+    let legendaryUsed = false;
+    const gems: TripGem[] = [];
+    for (const g of rawGems) {
+      const lat = typeof g?.lat === 'number' ? g.lat : parseFloat(g?.lat);
+      const lng = typeof g?.lng === 'number' ? g.lng : parseFloat(g?.lng);
+      const name = (g?.name || '').toString().trim();
+      if (!name || !isFinite(lat) || !isFinite(lng) || (lat === 0 && lng === 0)) continue;
+      if (poiNames.has(name.toLowerCase())) continue;
+      // Une pépite à plus de ~30 km de l'itinéraire est sûrement une erreur de coordonnées
+      if (ref && (Math.abs(lat - ref.lat) > 0.3 || Math.abs(lng - ref.lng) > 0.3)) continue;
+      let rarity: GemRarity = GEM_RARITIES.includes(g.rarity) ? g.rarity : 'commune';
+      if (rarity === 'legendaire') {
+        if (legendaryUsed) rarity = 'rare';
+        legendaryUsed = true;
+      }
+      const day = Number.isInteger(g.day) && g.day >= 1 && g.day <= dto.duration_days ? g.day : (gems.length % dto.duration_days) + 1;
+      gems.push({
+        id: `g${gems.length}`,
+        name,
+        teaser: (g.teaser || '').toString().trim() || `Un secret bien gardé de ${dto.destination}.`,
+        lat,
+        lng,
+        day,
+        category: (g.category || 'pépite').toString(),
+        rarity,
+        image_query: (g.image_query || name).toString(),
+        image_url: null,
+        collected_at: null,
+      });
+      if (gems.length >= expectedGemCount(dto.duration_days)) break;
+    }
+    return gems;
   }
 
   getCityCoordinates(destination: string): { lat: number; lng: number } {
@@ -343,6 +458,23 @@ Ces lieux seront présentés un par un à un groupe de voyageurs qui votent d'un
 - ESPRIT DE GROUPE : privilégie des lieux qui se vivent bien à plusieurs (tables partagées, activités, panoramas) et accessibles à un groupe.`
         : '';
 
+    // Pépites à collectionner (radar) : uniquement pour un voyage classique, même appel IA
+    const gemsCount = expectedGemCount(dto.duration_days);
+    const gemsSection = this.wantsGems(dto)
+      ? `
+
+## PÉPITES À COLLECTIONNER (radar de l'app)
+En plus de l'itinéraire, propose exactement ${gemsCount} "gems", 1 par jour (champ "day"). Le voyageur les ramasse sur place pour gagner de l'XP : elles doivent donner envie de faire un détour.
+- Lieux réels, secrets ou insolites (bar caché, atelier d'artisan, point de vue confidentiel, cour intérieure, street-art, librairie, marché de quartier...), ABSENTS de l'itinéraire.
+- Situés à 300 m - 1 km des lieux du même jour : un vrai détour, faisable ${transports}.
+- "teaser" : 1 phrase (20 mots max) qui intrigue sans tout dévoiler, avec un indice concret pour trouver ou vivre le lieu.
+- "rarity" : "commune" (la plupart), "rare" (vraiment confidentiel), "legendaire" (1 seule sur le séjour, la plus exceptionnelle).
+- "lat"/"lng" exacts du lieu (5 décimales) ; "image_query" = nom du lieu + ville.`
+      : '';
+    const gemsFormat = this.wantsGems(dto)
+      ? `,"gems":[{"name":"...","teaser":"...","lat":0.00000,"lng":0.00000,"day":1,"category":"bar","rarity":"commune","image_query":"..."}]`
+      : `,"gems":[]`;
+
     return `Tu es Voyago, guide local d'exception et expert en conception de voyages sur mesure.
 Conçois un itinéraire authentique, géographiquement optimisé et mémorable.
 
@@ -353,7 +485,7 @@ Conçois un itinéraire authentique, géographiquement optimisé et mémorable.
 - Rythme : ${paceDetails}
 - Déplacements : ${transports}
 - Budget : ${dto.budget} (adapte le standing des adresses)
-- Sensibilité thermique : ${this.getThermalSensitivityNote(dto.thermal_sensitivity)}${tribeContext}
+- Sensibilité thermique : ${this.getThermalSensitivityNote(dto.thermal_sensitivity)}${tribeContext}${gemsSection}
 
 ## RÈGLES
 1. VOLUME : exactement ${activitiesPerDay} lieux par jour, soit ${totalPoisCount} au total. Créneaux "order" : ${orderSlots}. Le lieu order 2 est un restaurant ou une adresse gourmande.
@@ -370,11 +502,11 @@ Conçois un itinéraire authentique, géographiquement optimisé et mémorable.
 
 ## FORMAT
 Réponds avec UNIQUEMENT un objet JSON compact (sans markdown, sans texte autour), trié par jour puis par order :
-{"pois":[{"name":"Nom officiel du lieu","description":"...","lat":0.00000,"lng":0.00000,"day":1,"order":1,"duration_minutes":90,"category":"culture","image_query":"English landmark name","rating":4.8,"reviews_count":3200,"insider_tip":"...","hidden_gem":false}]}
+{"pois":[{"name":"Nom officiel du lieu","description":"...","lat":0.00000,"lng":0.00000,"day":1,"order":1,"duration_minutes":90,"category":"culture","image_query":"English landmark name","rating":4.8,"reviews_count":3200,"insider_tip":"...","hidden_gem":false}]${gemsFormat}}
 Avant de répondre, vérifie : ${totalPoisCount} lieux, ${activitiesPerDay} par jour, 1 pépite par jour, aucun doublon, coordonnées propres à chaque lieu.`;
   }
 
-  private async generateWithGemini(dto: GenerateTripDto): Promise<POI[]> {
+  private async generateWithGemini(dto: GenerateTripDto): Promise<{ pois: POI[]; gems: TripGem[] }> {
     const modelsToTry = [
       'gemini-3.5-flash-lite',
       'gemini-3.5-flash',
@@ -410,7 +542,8 @@ Avant de répondre, vérifie : ${totalPoisCount} lieux, ${activitiesPerDay} par 
 
         const parsed = JSON.parse(jsonText);
         if (parsed.pois && Array.isArray(parsed.pois) && parsed.pois.length > 0) {
-          return this.sanitizePois(parsed.pois, dto, cityCoords);
+          const pois = this.sanitizePois(parsed.pois, dto, cityCoords);
+          return { pois, gems: this.sanitizeGems(parsed.gems, pois, dto) };
         }
       } catch (err) {
         this.logger.warn(`Model ${modelName} error: ${err.message}`);
@@ -421,13 +554,14 @@ Avant de répondre, vérifie : ${totalPoisCount} lieux, ${activitiesPerDay} par 
     throw new Error('All Gemini models failed to produce valid POIs');
   }
 
-  private async generateWithClaude(dto: GenerateTripDto): Promise<POI[]> {
+  private async generateWithClaude(dto: GenerateTripDto): Promise<{ pois: POI[]; gems: TripGem[] }> {
     const cityCoords = await this.resolveDestinationCoordinates(dto.destination);
     const prompt = this.buildOptimizedTripPrompt(dto, cityCoords);
 
     const activitiesPerDay = dto.pace === 'tranquille' ? 3 : dto.pace === 'intensif' ? 5 : 4;
     const expectedPois = dto.duration_days * activitiesPerDay;
-    const baseMaxTokens = Math.max(8000, expectedPois * TOKENS_PER_POI + 2000);
+    const gemTokens = this.wantsGems(dto) ? expectedGemCount(dto.duration_days) * TOKENS_PER_GEM : 0;
+    const baseMaxTokens = Math.max(8000, expectedPois * TOKENS_PER_POI + gemTokens + 2000);
 
     for (const { id: model, effort, extraTokens } of CLAUDE_MODELS) {
       const maxTokens = Math.min(CLAUDE_MAX_OUTPUT, baseMaxTokens + extraTokens);
@@ -466,13 +600,14 @@ Avant de répondre, vérifie : ${totalPoisCount} lieux, ${activitiesPerDay} par 
           continue;
         }
 
-        const parsed = JSON.parse(textBlock.text) as { pois?: unknown[] };
+        const parsed = JSON.parse(textBlock.text) as { pois?: unknown[]; gems?: unknown[] };
         if (Array.isArray(parsed.pois) && parsed.pois.length > 0) {
           this.logger.log(
             `Claude model ${model} generated ${parsed.pois.length} POIs in ${((Date.now() - startedAt) / 1000).toFixed(1)}s ` +
               `(${message.usage.output_tokens} output tokens)`,
           );
-          return this.sanitizePois(parsed.pois, dto, cityCoords);
+          const pois = this.sanitizePois(parsed.pois, dto, cityCoords);
+          return { pois, gems: this.sanitizeGems(parsed.gems as any[], pois, dto) };
         }
         this.logger.warn(`Claude model ${model} returned an empty POI list`);
       } catch (err) {

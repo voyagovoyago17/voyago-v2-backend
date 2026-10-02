@@ -101,6 +101,14 @@ export class Trip {
   @Prop({ default: 0 })
   comments_count: number;
 
+  /** Pépites à collectionner pendant le voyage (radar) : lieux secrets hors itinéraire */
+  @Prop({ type: [Object], default: [] })
+  gems: any[];
+
+  /** Début du radar pour un voyage sans dates (« Démarrer mon voyage ») */
+  @Prop({ type: Date, default: null })
+  gems_started_at?: Date | null;
+
   /** Nombre de voyageurs ayant refait ce voyage (copie partagée) */
   @Prop({ default: 0 })
   remix_count: number;

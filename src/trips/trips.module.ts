@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { MongooseModule } from '@nestjs/mongoose';
 import { TripsController } from './trips.controller';
 import { TripsService } from './trips.service';
+import { TripGemsService } from './trip-gems.service';
 import { Trip, TripSchema } from './schemas/trip.schema';
 import { CommunityMember, CommunityMemberSchema } from '../community/schemas/community-member.schema';
 import { UserBlock, UserBlockSchema } from '../community/schemas/user-block.schema';
@@ -42,7 +43,7 @@ import { GLOBAL_DB_CONNECTION, TENANT_DB_CONNECTION } from '../common/constants'
     GamificationModule,
   ],
   controllers: [TripsController],
-  providers: [TripsService, SessionAuthGuard, OptionalSessionAuthGuard],
+  providers: [TripsService, TripGemsService, SessionAuthGuard, OptionalSessionAuthGuard],
   exports: [
     TripsService,
     MongooseModule.forFeature([{ name: Trip.name, schema: TripSchema }], TENANT_DB_CONNECTION),

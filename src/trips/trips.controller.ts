@@ -14,10 +14,15 @@ import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { GenerateTripDto } from './dto/generate-trip.dto';
 import { UpdateTripVisibilityDto } from './dto/update-visibility.dto';
 import { RemixTripDto } from './dto/remix-trip.dto';
+import { CollectGemDto } from './dto/collect-gem.dto';
+import { TripGemsService } from './trip-gems.service';
 
 @Controller()
 export class TripsController {
-  constructor(private readonly tripsService: TripsService) {}
+  constructor(
+    private readonly tripsService: TripsService,
+    private readonly tripGemsService: TripGemsService,
+  ) {}
 
   @Get('trips/:user_id')
   @UseGuards(OptionalSessionAuthGuard)
@@ -57,6 +62,32 @@ export class TripsController {
     @Body() dto: RemixTripDto,
   ) {
     return this.tripsService.remixTrip(user, trip_id, dto.start_date);
+  }
+
+  // Radar des pépites : lieux secrets à ramasser sur place pendant le voyage
+
+  @Get('trip/:trip_id/gems')
+  @UseGuards(SessionAuthGuard)
+  async getGems(@CurrentUser() user: any, @Param('trip_id') trip_id: string) {
+    return this.tripGemsService.getGems(user.user_id, trip_id);
+  }
+
+  /** Voyage sans dates : démarre le radar pour la durée du voyage */
+  @Post('trip/:trip_id/gems/start')
+  @UseGuards(SessionAuthGuard)
+  async startGems(@CurrentUser() user: any, @Param('trip_id') trip_id: string) {
+    return this.tripGemsService.start(user.user_id, trip_id);
+  }
+
+  @Post('trip/:trip_id/gems/:gem_id/collect')
+  @UseGuards(SessionAuthGuard)
+  async collectGem(
+    @CurrentUser() user: any,
+    @Param('trip_id') trip_id: string,
+    @Param('gem_id') gem_id: string,
+    @Body() dto: CollectGemDto,
+  ) {
+    return this.tripGemsService.collect(user.user_id, trip_id, gem_id, dto.lat, dto.lng);
   }
 
   @Post('trips/generate')
