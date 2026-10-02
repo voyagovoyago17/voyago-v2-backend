@@ -42,6 +42,13 @@ export class NotificationsController {
     return this.notificationsService.markAllRead(user.user_id);
   }
 
+  /** Envoie une notification de test à mes appareils (diagnostic des push). */
+  @Post('test')
+  @HttpCode(200)
+  async sendTest(@CurrentUser() user: any) {
+    return this.notificationsService.sendTest(user.user_id);
+  }
+
   @Post('arrival')
   async arrival(@CurrentUser() user: any, @Body() dto: ArrivalDto) {
     return this.notificationsService.recordArrival(user.user_id, dto);
