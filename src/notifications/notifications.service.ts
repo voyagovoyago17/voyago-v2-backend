@@ -77,11 +77,9 @@ export class NotificationsService {
   private pushSafely(userId: string, n: ReturnType<NotificationsService['toDto']>): void {
     if (!this.pushService.enabled || IN_APP_ONLY_TYPES.includes(n.type)) return;
     (async () => {
-      const { unread_count } = await this.unreadCount(userId);
       await this.pushService.sendToUser(userId, {
         title: n.title,
         body: n.body,
-        badge: unread_count,
         imageUrl: n.data?.image_url,
         // L'app lit « payload » pour ouvrir le bon écran, comme depuis la cloche
         data: { notification_id: n.id, type: n.type, payload: n.data },
