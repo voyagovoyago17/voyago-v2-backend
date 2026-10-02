@@ -14,11 +14,13 @@ import * as crypto from 'crypto';
 import * as bcrypt from 'bcrypt';
 import { v4 as uuidv4 } from 'uuid';
 import axios from 'axios';
-import { Resend } from 'resend';
 
 import { User, UserDocument } from './schemas/user.schema';
 import { UserSession, UserSessionDocument } from './schemas/user-session.schema';
 import { PasswordReset, PasswordResetDocument } from './schemas/password-reset.schema';
+import { EmailVerification, EmailVerificationDocument } from './schemas/email-verification.schema';
+import { MailService } from '../mail/mail.service';
+import { GamificationService } from '../gamification/gamification.service';
 import { ProfileSchema } from '../gamification/schemas/profile.schema';
 
 import { SignupDto } from './dto/signup.dto';
@@ -32,23 +34,33 @@ import { GLOBAL_DB_CONNECTION } from '../common/constants';
 import { isProActive } from '../pro/pro-status';
 import { TenancyService } from '../tenancy/tenancy.service';
 
+/** Validité des codes envoyés par e-mail */
+const VERIFY_CODE_MINUTES = 15;
+const RESET_CODE_MINUTES = 30;
+/** Délai minimum entre deux envois de code (anti-spam) */
+const CODE_RESEND_COOLDOWN_S = 60;
+const MAX_CODE_ATTEMPTS = 5;
+
+/** Code à 6 chiffres, tiré avec un générateur cryptographique */
+function sixDigitCode(): string {
+  return crypto.randomInt(0, 1_000_000).toString().padStart(6, '0');
+}
+
 @Injectable()
 export class AuthService {
-  private resend: Resend;
   private readonly logger = new Logger(AuthService.name);
 
   constructor(
     @InjectModel(User.name, GLOBAL_DB_CONNECTION) private readonly userModel: Model<UserDocument>,
     @InjectModel(UserSession.name, GLOBAL_DB_CONNECTION) private readonly sessionModel: Model<UserSessionDocument>,
     @InjectModel(PasswordReset.name, GLOBAL_DB_CONNECTION) private readonly passwordResetModel: Model<PasswordResetDocument>,
+    @InjectModel(EmailVerification.name, GLOBAL_DB_CONNECTION)
+    private readonly emailVerificationModel: Model<EmailVerificationDocument>,
     private readonly tenancyService: TenancyService,
     private readonly configService: ConfigService,
-  ) {
-    const resendKey = this.configService.get<string>('RESEND_API_KEY');
-    if (resendKey) {
-      this.resend = new Resend(resendKey);
-    }
-  }
+    private readonly mailService: MailService,
+    private readonly gamificationService: GamificationService,
+  ) {}
 
   private generateSessionToken(): string {
     return crypto.randomBytes(36).toString('base64url');
@@ -141,6 +153,11 @@ export class AuthService {
     await this.createProfile(user_id);
     const session_token = await this.createSession(user_id);
 
+    // Code de vérification envoyé tout de suite (n'empêche jamais l'inscription d'aboutir)
+    this.sendEmailVerification(user).catch((err) =>
+      this.logger.warn(`Code de vérification non envoyé à ${user.email}: ${err.message}`),
+    );
+
     return { session_token, user_id, tenant_id: user_id, user: this.sanitizeUser(user) };
   }
 
@@ -201,6 +218,9 @@ export class AuthService {
         user_id,
         auth_provider: 'google',
         email: email.toLowerCase(),
+        // Adresse déjà confirmée par Google
+        email_verified: true,
+        email_verified_at: new Date(),
         name,
         picture,
         tenant_id: user_id,
@@ -211,6 +231,13 @@ export class AuthService {
       });
       await this.createProfile(user_id);
     } else {
+      // Connexion Google : l'adresse est confirmée par Google
+      if (!user.email_verified) {
+        await this.userModel
+          .updateOne({ user_id: user.user_id }, { $set: { email_verified: true, email_verified_at: new Date() } })
+          .exec();
+        user.email_verified = true;
+      }
       // Update picture if changed
       if (picture && user.picture !== picture) {
         await this.userModel.updateOne({ user_id: user.user_id }, { $set: { picture } }).exec();
@@ -260,98 +287,181 @@ export class AuthService {
     return { session_token, user_id: user.user_id, tenant_id: guest_user_id, user: this.sanitizeUser(user) };
   }
 
-  async forgotPassword(dto: ForgotPasswordDto): Promise<{ message: string }> {
-    const user = await this.userModel.findOne({ email: dto.email.toLowerCase() }).exec();
+  // =========================================================================
+  // VÉRIFICATION DE L'ADRESSE E-MAIL (code à 6 chiffres)
+  // =========================================================================
 
-    // Always return success to avoid email enumeration
-    if (!user || user.auth_provider !== 'email') {
-      return { message: 'If that email is registered, a reset code has been sent.' };
+  /**
+   * Envoie (ou renvoie) un code de vérification à l'adresse du compte.
+   * Un seul code actif par compte, un envoi toutes les 60 secondes au plus.
+   */
+  async sendEmailVerification(user: UserDocument): Promise<object> {
+    if (!user.email) {
+      throw new BadRequestException("Ce compte n'a pas d'adresse e-mail");
+    }
+    if (user.email_verified) {
+      return { sent: false, already_verified: true, email: user.email };
     }
 
-    // Generate 6-digit code
-    const code = Math.floor(100000 + Math.random() * 900000).toString();
-    const code_hash = await bcrypt.hash(code, 10);
-    const expires_at = new Date(Date.now() + 30 * 60 * 1000); // 30 minutes
+    const previous = await this.emailVerificationModel.findOne({ user_id: user.user_id }).lean().exec();
+    if (previous) {
+      const elapsed = (Date.now() - new Date(previous.created_at).getTime()) / 1000;
+      if (elapsed < CODE_RESEND_COOLDOWN_S) {
+        const wait = Math.ceil(CODE_RESEND_COOLDOWN_S - elapsed);
+        return { sent: false, cooldown_seconds: wait, email: user.email, message: `Patiente ${wait} s avant de redemander un code` };
+      }
+    }
 
-    // Remove existing resets for this email
-    await this.passwordResetModel.deleteMany({ email: dto.email.toLowerCase() }).exec();
+    const code = sixDigitCode();
+    await this.emailVerificationModel
+      .findOneAndUpdate(
+        { user_id: user.user_id },
+        {
+          $set: {
+            email: user.email,
+            code_hash: await bcrypt.hash(code, 10),
+            expires_at: new Date(Date.now() + VERIFY_CODE_MINUTES * 60 * 1000),
+            attempts: 0,
+            created_at: new Date(),
+          },
+        },
+        { upsert: true },
+      )
+      .exec();
 
+    const sent = await this.mailService.sendEmailVerificationCode(user.email, user.pseudo || user.name, code, VERIFY_CODE_MINUTES);
+    if (!sent) {
+      await this.emailVerificationModel.deleteOne({ user_id: user.user_id }).exec();
+      throw new InternalServerErrorException("L'e-mail n'a pas pu être envoyé, réessaie dans un instant");
+    }
+    return {
+      sent: true,
+      email: user.email,
+      cooldown_seconds: CODE_RESEND_COOLDOWN_S,
+      expires_in_minutes: VERIFY_CODE_MINUTES,
+    };
+  }
+
+  /** Confirme l'adresse avec le code reçu : badge « vérifié » et un peu d'XP. */
+  async confirmEmailVerification(user: UserDocument, code: string): Promise<object> {
+    if (user.email_verified) {
+      return { verified: true, user: this.sanitizeUser(user) };
+    }
+    const pending = await this.emailVerificationModel.findOne({ user_id: user.user_id }).exec();
+    if (!pending || pending.email !== user.email) {
+      throw new BadRequestException('Aucun code en cours : demande un nouveau code');
+    }
+    if (new Date() > pending.expires_at) {
+      await this.emailVerificationModel.deleteOne({ _id: pending._id }).exec();
+      throw new BadRequestException('Ce code a expiré : demande un nouveau code');
+    }
+    if (pending.attempts >= MAX_CODE_ATTEMPTS) {
+      throw new BadRequestException('Trop de tentatives : demande un nouveau code');
+    }
+    if (!(await bcrypt.compare(code, pending.code_hash))) {
+      await this.emailVerificationModel.updateOne({ _id: pending._id }, { $inc: { attempts: 1 } }).exec();
+      const left = MAX_CODE_ATTEMPTS - pending.attempts - 1;
+      throw new BadRequestException(
+        left > 0 ? `Code incorrect (${left} essai${left > 1 ? 's' : ''} restant${left > 1 ? 's' : ''})` : 'Code incorrect : demande un nouveau code',
+      );
+    }
+
+    const updated = await this.userModel
+      .findOneAndUpdate(
+        { user_id: user.user_id },
+        { $set: { email_verified: true, email_verified_at: new Date() } },
+        { new: true },
+      )
+      .exec();
+    await this.emailVerificationModel.deleteOne({ _id: pending._id }).exec();
+
+    let xp_awarded = 0;
+    try {
+      const res: any = await this.gamificationService.awardXP(user.user_id, 'compte_verifie');
+      xp_awarded = res?.xp_awarded || 0;
+    } catch (err: any) {
+      this.logger.warn(`XP de vérification non attribuée à ${user.user_id}: ${err.message}`);
+    }
+    return { verified: true, xp_awarded, user: this.sanitizeUser(updated!) };
+  }
+
+  // =========================================================================
+  // MOT DE PASSE OUBLIÉ (code à 6 chiffres)
+  // =========================================================================
+
+  async forgotPassword(dto: ForgotPasswordDto): Promise<{ message: string; cooldown_seconds: number }> {
+    const email = dto.email.toLowerCase().trim();
+    // Même réponse dans tous les cas : on ne révèle pas si l'adresse a un compte
+    const response = {
+      message: 'Si un compte existe avec cette adresse, un code vient de lui être envoyé.',
+      cooldown_seconds: CODE_RESEND_COOLDOWN_S,
+    };
+
+    const user = await this.userModel.findOne({ email }).exec();
+    if (!user || user.auth_provider !== 'email') {
+      return response;
+    }
+
+    const previous = await this.passwordResetModel.findOne({ email }).sort({ created_at: -1 }).lean().exec();
+    if (previous && (Date.now() - new Date(previous.created_at).getTime()) / 1000 < CODE_RESEND_COOLDOWN_S) {
+      return response;
+    }
+
+    const code = sixDigitCode();
+    await this.passwordResetModel.deleteMany({ email }).exec();
     await this.passwordResetModel.create({
-      email: dto.email.toLowerCase(),
+      email,
       user_id: user.user_id,
-      code_hash,
-      expires_at,
+      code_hash: await bcrypt.hash(code, 10),
+      expires_at: new Date(Date.now() + RESET_CODE_MINUTES * 60 * 1000),
       attempts: 0,
       created_at: new Date(),
     });
 
-    // Send email via Resend
-    if (this.resend) {
-      try {
-        await this.resend.emails.send({
-          from: 'Voyago <noreply@voyago.app>',
-          to: dto.email,
-          subject: 'Votre code de réinitialisation Voyago',
-          html: `
-            <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto;">
-              <h2 style="color: #6366f1;">Réinitialisation de mot de passe</h2>
-              <p>Voici votre code de réinitialisation :</p>
-              <div style="background: #f3f4f6; padding: 20px; text-align: center; border-radius: 8px; margin: 20px 0;">
-                <span style="font-size: 36px; font-weight: bold; letter-spacing: 8px; color: #111827;">${code}</span>
-              </div>
-              <p>Ce code expire dans <strong>30 minutes</strong>.</p>
-              <p>Si vous n'avez pas demandé cette réinitialisation, ignorez cet email.</p>
-            </div>
-          `,
-        });
-      } catch (err) {
-        console.error('Failed to send reset email:', err);
-      }
-    } else {
-      console.log(`[DEV] Password reset code for ${dto.email}: ${code}`);
-    }
-
-    return { message: 'If that email is registered, a reset code has been sent.' };
+    await this.mailService.sendPasswordResetCode(email, user.pseudo || user.name, code, RESET_CODE_MINUTES);
+    return response;
   }
 
   async resetPassword(dto: ResetPasswordDto): Promise<{ message: string }> {
-    const reset = await this.passwordResetModel
-      .findOne({ email: dto.email.toLowerCase() })
-      .sort({ created_at: -1 })
-      .exec();
+    const email = dto.email.toLowerCase().trim();
+    const reset = await this.passwordResetModel.findOne({ email }).sort({ created_at: -1 }).exec();
 
     if (!reset) {
-      throw new BadRequestException('No reset request found for this email');
+      throw new BadRequestException('Aucune demande en cours pour cette adresse : demande un nouveau code');
     }
-
     if (new Date() > reset.expires_at) {
       await this.passwordResetModel.deleteOne({ _id: reset._id }).exec();
-      throw new BadRequestException('Reset code has expired');
+      throw new BadRequestException('Ce code a expiré : demande un nouveau code');
     }
-
-    if (reset.attempts >= 5) {
-      throw new BadRequestException('Too many failed attempts. Please request a new code.');
+    if (reset.attempts >= MAX_CODE_ATTEMPTS) {
+      throw new BadRequestException('Trop de tentatives : demande un nouveau code');
     }
-
-    const valid = await bcrypt.compare(dto.code, reset.code_hash);
-    if (!valid) {
+    if (!(await bcrypt.compare(dto.code, reset.code_hash))) {
       await this.passwordResetModel.updateOne({ _id: reset._id }, { $inc: { attempts: 1 } }).exec();
-      throw new BadRequestException('Invalid reset code');
+      const left = MAX_CODE_ATTEMPTS - reset.attempts - 1;
+      throw new BadRequestException(
+        left > 0 ? `Code incorrect (${left} essai${left > 1 ? 's' : ''} restant${left > 1 ? 's' : ''})` : 'Code incorrect : demande un nouveau code',
+      );
     }
 
     const password_hash = await bcrypt.hash(dto.new_password, 12);
-    await this.userModel.updateOne(
-      { user_id: reset.user_id },
-      { $set: { password_hash } },
-    ).exec();
+    // Le code reçu par e-mail prouve aussi que l'adresse appartient au voyageur
+    const user = await this.userModel
+      .findOneAndUpdate(
+        { user_id: reset.user_id },
+        { $set: { password_hash, email_verified: true, email_verified_at: new Date() } },
+        { new: true },
+      )
+      .exec();
 
-    // Invalidate all sessions
+    // Déconnexion de tous les appareils, puis alerte de sécurité
     await this.sessionModel.deleteMany({ user_id: reset.user_id }).exec();
-
-    // Remove reset record
     await this.passwordResetModel.deleteOne({ _id: reset._id }).exec();
+    if (user?.email) {
+      this.mailService.sendPasswordChanged(user.email, user.pseudo || user.name).catch(() => {});
+    }
 
-    return { message: 'Password reset successfully' };
+    return { message: 'Mot de passe modifié : tu peux te connecter avec le nouveau.' };
   }
 
   async getMe(user: UserDocument): Promise<object> {

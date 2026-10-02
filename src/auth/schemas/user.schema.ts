@@ -53,6 +53,13 @@ export class User {
   @Prop()
   password_hash: string;
 
+  /** Adresse e-mail confirmée (code reçu par e-mail, ou compte Google) */
+  @Prop({ default: false })
+  email_verified: boolean;
+
+  @Prop({ type: Date, default: null })
+  email_verified_at: Date | null;
+
   @Prop({ default: false })
   is_pro: boolean;
 

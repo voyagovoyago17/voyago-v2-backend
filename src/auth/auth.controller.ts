@@ -17,6 +17,7 @@ import { SignupDto } from './dto/signup.dto';
 import { LoginDto } from './dto/login.dto';
 import { GoogleSessionDto } from './dto/google-session.dto';
 import { ForgotPasswordDto } from './dto/forgot-password.dto';
+import { ConfirmEmailDto } from './dto/confirm-email.dto';
 import { UpdateProfileDto } from './dto/update-profile.dto';
 import { GuestLoginDto } from './dto/guest-login.dto';
 import { randomUUID } from 'crypto';
@@ -54,6 +55,22 @@ export class AuthController {
     const rawId = dto?.user_id || dto?.guest_id;
     const guestId = (rawId && rawId.startsWith('guest_')) ? rawId : `guest_${randomUUID()}`;
     return this.authService.guestLogin(guestId);
+  }
+
+  /** Envoie (ou renvoie) le code de vérification de l'adresse e-mail du compte */
+  @Post('email/verification/send')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(SessionAuthGuard)
+  async sendEmailVerification(@CurrentUser() user: any) {
+    return this.authService.sendEmailVerification(user);
+  }
+
+  /** Confirme l'adresse e-mail avec le code reçu */
+  @Post('email/verification/confirm')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(SessionAuthGuard)
+  async confirmEmailVerification(@CurrentUser() user: any, @Body() dto: ConfirmEmailDto) {
+    return this.authService.confirmEmailVerification(user, dto.code);
   }
 
   @Post('forgot-password')
