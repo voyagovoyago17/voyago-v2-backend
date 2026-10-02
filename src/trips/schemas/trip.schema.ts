@@ -97,6 +97,10 @@ export class Trip {
   @Prop({ type: [String], default: [] })
   liked_by: string[];
 
+  /** Commentaires de la communauté (tenu à jour sur la copie partagée) */
+  @Prop({ default: 0 })
+  comments_count: number;
+
   @Prop({ default: Date.now })
   created_at: Date;
 

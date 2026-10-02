@@ -38,6 +38,9 @@ export class CommunityPost {
   @Prop({ type: [String], default: [] })
   liked_by: string[];
 
+  @Prop({ default: 0 })
+  comments_count: number;
+
   @Prop()
   created_at: Date;
 
@@ -46,3 +49,5 @@ export class CommunityPost {
 }
 
 export const CommunityPostSchema = SchemaFactory.createForClass(CommunityPost);
+// Fil d'actualité : posts des cercles de l'utilisateur, du plus récent au plus ancien
+CommunityPostSchema.index({ circle_id: 1, created_at: -1 });

@@ -60,7 +60,7 @@ export class CommunityService {
   }
 
   /** Utilisateur authentifié par son jeton uniquement (jamais par un paramètre de requête). */
-  private authUserId(authHeader?: string): Promise<string | undefined> {
+  authUserId(authHeader?: string): Promise<string | undefined> {
     return this.resolveUserId(undefined, authHeader);
   }
 
@@ -68,7 +68,7 @@ export class CommunityService {
    * Un cercle privé n'existe que pour ses membres : les autres reçoivent un 404,
    * pour ne pas révéler son existence.
    */
-  private async assertCircleAccess(circle: any, userId?: string): Promise<any | null> {
+  async assertCircleAccess(circle: any, userId?: string): Promise<any | null> {
     const membership = userId
       ? await this.memberModel.findOne({ circle_id: circle.id, user_id: userId }).lean().exec()
       : null;
@@ -144,6 +144,135 @@ export class CommunityService {
           : null,
       };
     });
+  }
+
+  /**
+   * Fil d'actualité façon réseau social, du plus récent au plus ancien :
+   * - voyages publics, et ceux « tribu » des membres de mes cercles
+   * - publications de tous les cercles dont je suis membre
+   * Pagination par curseur : `before` = created_at du dernier élément reçu.
+   */
+  async getHomeFeed(authHeader?: string, before?: string, limit = 20): Promise<object> {
+    const viewerId = await this.authUserId(authHeader);
+    const pageSize = Math.min(Math.max(limit || 20, 1), 50);
+    const parsedBefore = before ? new Date(before) : null;
+    const beforeDate = parsedBefore && !isNaN(parsedBefore.getTime()) ? parsedBefore : new Date();
+
+    const [mates, myCircleIds] = viewerId
+      ? await Promise.all([
+          tribeMateIds(this.memberModel, viewerId),
+          this.memberModel.distinct('circle_id', { user_id: viewerId }).exec() as Promise<string[]>,
+        ])
+      : [[] as string[], [] as string[]];
+
+    const tripFilter: any = {
+      created_at: { $lt: beforeDate },
+      $or: [{ is_public: true }, ...(viewerId ? [{ visibility: 'tribe', user_id: { $in: mates } }] : [])],
+    };
+
+    const [trips, posts]: [any[], any[]] = await Promise.all([
+      this.sharedTripModel.find(tripFilter).select('-weather').sort({ created_at: -1 }).limit(pageSize).lean().exec(),
+      myCircleIds.length
+        ? this.postModel
+            .find({ circle_id: { $in: myCircleIds }, created_at: { $lt: beforeDate } })
+            .sort({ created_at: -1 })
+            .limit(pageSize)
+            .lean()
+            .exec()
+        : Promise.resolve([]),
+    ]);
+
+    const merged = [
+      ...trips.map((t) => ({ kind: 'trip' as const, doc: t, at: new Date(t.created_at) })),
+      ...posts.map((p) => ({ kind: 'post' as const, doc: p, at: new Date(p.created_at) })),
+    ]
+      .sort((a, b) => b.at.getTime() - a.at.getTime())
+      .slice(0, pageSize);
+
+    // Données liées : auteurs, cercles, voyages joints aux publications (si visibles)
+    const pagePosts = merged.filter((m) => m.kind === 'post').map((m) => m.doc);
+    const linkedTripIds = [...new Set(pagePosts.map((p) => p.trip_id).filter(Boolean))];
+    const [users, circles, linkedTrips]: [any[], any[], any[]] = await Promise.all([
+      this.userModel
+        .find({ user_id: { $in: [...new Set(merged.map((m) => m.doc.user_id))] } })
+        .lean()
+        .exec(),
+      this.circleModel
+        .find({ id: { $in: [...new Set(pagePosts.map((p) => p.circle_id))] } })
+        .select('id name slug avatar_emoji is_public')
+        .lean()
+        .exec(),
+      linkedTripIds.length
+        ? this.sharedTripModel.find({ id: { $in: linkedTripIds } }).select('-weather').lean().exec()
+        : Promise.resolve([]),
+    ]);
+    const userMap = new Map(users.map((u) => [u.user_id, u]));
+    const circleMap = new Map(circles.map((c) => [c.id, c]));
+    const mateSet = new Set(mates);
+    const tripMap = new Map(
+      linkedTrips
+        .filter((t) => {
+          const visibility = tripVisibility(t);
+          return visibility === 'public' || t.user_id === viewerId || (visibility === 'tribe' && mateSet.has(t.user_id));
+        })
+        .map((t) => [t.id, t]),
+    );
+
+    const authorOf = (userId: string) => {
+      const u = userMap.get(userId);
+      return u
+        ? {
+            user_id: u.user_id,
+            name: u.name,
+            pseudo: u.pseudo || null,
+            avatar_emoji: u.avatar_emoji || null,
+            picture: u.picture || null,
+            is_pro: u.is_pro || false,
+          }
+        : null;
+    };
+    const publicTrip = (t: any) => {
+      const { liked_by, ...rest } = t;
+      return {
+        ...rest,
+        visibility: tripVisibility(t),
+        cover_image_url: t.cover_image_url || t.pois?.[0]?.image_url || null,
+      };
+    };
+
+    const items = merged.map(({ kind, doc }) => {
+      const liked = !!viewerId && (doc.liked_by || []).includes(viewerId);
+      if (kind === 'trip') {
+        return {
+          type: 'trip',
+          id: doc.id,
+          created_at: doc.created_at,
+          author: authorOf(doc.user_id),
+          trip: publicTrip(doc),
+          liked_by_me: liked,
+          likes: Math.max(0, doc.likes || 0),
+          comments_count: Math.max(0, doc.comments_count || 0),
+        };
+      }
+      const { liked_by, ...post } = doc;
+      const linked = doc.trip_id ? tripMap.get(doc.trip_id) : null;
+      return {
+        type: 'post',
+        id: doc.id,
+        created_at: doc.created_at,
+        author: authorOf(doc.user_id),
+        post: { ...post, trip: linked ? publicTrip(linked) : null },
+        circle: circleMap.get(doc.circle_id) || null,
+        liked_by_me: liked,
+        likes: Math.max(0, doc.likes_count || 0),
+        comments_count: Math.max(0, doc.comments_count || 0),
+      };
+    });
+
+    return {
+      items,
+      next_before: items.length === pageSize ? items[items.length - 1].created_at : null,
+    };
   }
 
   async getUserPublicProfile(user_id: string): Promise<object> {

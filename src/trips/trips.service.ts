@@ -450,11 +450,12 @@ export class TripsService {
     if (visibility === 'private') {
       await this.sharedTripModel.updateOne({ id: tripId }, { $set: visibilityFields(visibility) }).exec();
     } else {
-      const { _id, __v, likes, liked_by, ...mirror } = trip;
+      // Likes et commentaires ne vivent que sur la copie partagée : on ne les écrase pas
+      const { _id, __v, likes, liked_by, comments_count, ...mirror } = trip;
       await this.sharedTripModel
         .updateOne(
           { id: tripId },
-          { $set: mirror, $setOnInsert: { likes: 0, liked_by: [] } },
+          { $set: mirror, $setOnInsert: { likes: 0, liked_by: [], comments_count: 0 } },
           { upsert: true },
         )
         .exec();

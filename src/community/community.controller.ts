@@ -8,6 +8,7 @@ import {
   Query,
   UseGuards,
   Headers,
+  BadRequestException,
 } from '@nestjs/common';
 import { CommunityService } from './community.service';
 import { SessionAuthGuard } from '../common/guards/session-auth.guard';
@@ -16,10 +17,17 @@ import { CreateCircleDto } from './dto/create-circle.dto';
 import { CreatePostDto } from './dto/create-post.dto';
 import { ShareTripToCircleDto } from './dto/share-trip.dto';
 import { JoinCircleByCodeDto } from './dto/join-by-code.dto';
+import { CreateCommentDto } from './dto/create-comment.dto';
+import { ReportContentDto } from './dto/report.dto';
+import { CommunitySocialService } from './community-social.service';
+import { COMMENT_TARGET_TYPES, CommentTargetType } from './schemas/community-comment.schema';
 
 @Controller('community')
 export class CommunityController {
-  constructor(private readonly communityService: CommunityService) {}
+  constructor(
+    private readonly communityService: CommunityService,
+    private readonly socialService: CommunitySocialService,
+  ) {}
 
   // =========================================================================
   // 1. PUBLIC FEED & USER PUBLIC PROFILE (LOGIQUE EXISTANTE CONSERVÉE)
@@ -28,6 +36,16 @@ export class CommunityController {
   @Get('feed')
   async getPublicFeed(@Headers('authorization') authHeader?: string) {
     return this.communityService.getPublicFeed(authHeader);
+  }
+
+  /** Fil d'actualité : voyages visibles + publications de mes cercles (pagination par curseur) */
+  @Get('home-feed')
+  async getHomeFeed(
+    @Headers('authorization') authHeader?: string,
+    @Query('before') before?: string,
+    @Query('limit') limit?: string,
+  ) {
+    return this.communityService.getHomeFeed(authHeader, before, limit ? parseInt(limit, 10) : undefined);
   }
 
   @Get('user/:id')
@@ -161,6 +179,46 @@ export class CommunityController {
     @Body() dto: ShareTripToCircleDto,
   ) {
     return this.communityService.shareTripToCircle(user.user_id, id, dto);
+  }
+
+  @Delete('posts/:id')
+  @UseGuards(SessionAuthGuard)
+  async deletePost(@CurrentUser() user: any, @Param('id') id: string) {
+    return this.socialService.deletePost(user.user_id, id);
+  }
+
+  // =========================================================================
+  // 4. COMMENTAIRES & SIGNALEMENTS
+  // =========================================================================
+
+  @Get('comments')
+  async getComments(
+    @Query('target_type') targetType: string,
+    @Query('target_id') targetId: string,
+    @Headers('authorization') authHeader?: string,
+  ) {
+    if (!(COMMENT_TARGET_TYPES as readonly string[]).includes(targetType) || !targetId) {
+      throw new BadRequestException('target_type (trip | post) et target_id sont requis');
+    }
+    return this.socialService.listComments(targetType as CommentTargetType, targetId, authHeader);
+  }
+
+  @Post('comments')
+  @UseGuards(SessionAuthGuard)
+  async addComment(@CurrentUser() user: any, @Body() dto: CreateCommentDto) {
+    return this.socialService.addComment(user.user_id, dto);
+  }
+
+  @Delete('comments/:id')
+  @UseGuards(SessionAuthGuard)
+  async deleteComment(@CurrentUser() user: any, @Param('id') id: string) {
+    return this.socialService.deleteComment(user.user_id, id);
+  }
+
+  @Post('reports')
+  @UseGuards(SessionAuthGuard)
+  async report(@CurrentUser() user: any, @Body() dto: ReportContentDto) {
+    return this.socialService.report(user.user_id, dto.target_type, dto.target_id, dto.reason);
   }
 
   @Post('posts/:id/like')
