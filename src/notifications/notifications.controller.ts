@@ -1,4 +1,6 @@
-import { Body, Controller, Delete, Get, HttpCode, Param, Post, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, HttpCode, MessageEvent, Param, Patch, Post, Query, Sse, UseGuards } from '@nestjs/common';
+import { Observable } from 'rxjs';
+import { IsBoolean, IsOptional } from 'class-validator';
 import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
 import { NotificationsService } from './notifications.service';
 import { SessionAuthGuard } from '../common/guards/session-auth.guard';
@@ -6,6 +8,20 @@ import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { ArrivalDto } from './dto/arrival.dto';
 import { RegisterDeviceDto, UnregisterDeviceDto } from './dto/register-device.dto';
 import { PushService } from './push/push.service';
+
+class NotificationPrefsDto {
+  @IsOptional()
+  @IsBoolean()
+  sound?: boolean;
+
+  @IsOptional()
+  @IsBoolean()
+  social?: boolean;
+
+  @IsOptional()
+  @IsBoolean()
+  quiet_hours?: boolean;
+}
 
 @ApiTags('🔔 Notifications & Alertes')
 @ApiBearerAuth()
@@ -30,6 +46,25 @@ export class NotificationsController {
   @HttpCode(200)
   async unregisterDevice(@CurrentUser() user: any, @Body() dto: UnregisterDeviceDto) {
     return this.pushService.unregisterDevice(user.user_id, dto.token);
+  }
+
+  /** Temps réel : l'app ouverte reçoit chaque notification à la seconde (Server-Sent Events) */
+  @ApiOperation({ summary: 'Flux temps réel des notifications (SSE)' })
+  @Sse('stream')
+  stream(@CurrentUser() user: any): Observable<MessageEvent> {
+    return this.notificationsService.stream(user.user_id);
+  }
+
+  @ApiOperation({ summary: 'Préférences de notification (son, social, heures calmes)' })
+  @Get('preferences')
+  async getPrefs(@CurrentUser() user: any) {
+    return this.notificationsService.getPrefs(user.user_id);
+  }
+
+  @ApiOperation({ summary: 'Modifier mes préférences de notification' })
+  @Patch('preferences')
+  async updatePrefs(@CurrentUser() user: any, @Body() dto: NotificationPrefsDto) {
+    return this.notificationsService.updatePrefs(user.user_id, dto);
   }
 
   @ApiOperation({ summary: 'Lister les notifications in-app reçues par l’utilisateur' })

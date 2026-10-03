@@ -7,6 +7,9 @@ import { ArrivalDto } from './dto/arrival.dto';
 import { placeKey } from '../places/place-key';
 import { GLOBAL_DB_CONNECTION } from '../common/constants';
 import { PushService } from './push/push.service';
+import { Observable, Subject, filter, interval, map, merge } from 'rxjs';
+import { User, UserDocument } from '../auth/schemas/user.schema';
+import { DEFAULT_PREFS, Delivery, NotificationPrefs, SOCIAL_BURST_WINDOW_MS, SOCIAL_TYPES, decideDelivery, prefsOf } from './notification-policy';
 
 /** Types déjà affichés à l'écran par l'app au moment où ils naissent : pas de push en double. */
 const IN_APP_ONLY_TYPES: NotificationType[] = ['arrival'];
@@ -27,7 +30,36 @@ export class NotificationsService implements OnModuleInit {
     @InjectModel(Notification.name, GLOBAL_DB_CONNECTION)
     private readonly notificationModel: Model<NotificationDocument>,
     private readonly pushService: PushService,
+    @InjectModel(User.name, GLOBAL_DB_CONNECTION) private readonly userModel: Model<UserDocument>,
   ) {}
+
+  /** Notifications fraîches, relayées en direct aux apps ouvertes (flux SSE) */
+  private readonly live$ = new Subject<{ userId: string; notification: any; delivery: Delivery }>();
+
+  /** Flux temps réel d'un voyageur : chaque nouvelle notification + un battement toutes les 25 s */
+  stream(userId: string): Observable<{ type?: string; data: any }> {
+    return merge(
+      this.live$.pipe(
+        filter((e) => e.userId === userId),
+        map((e) => ({ type: 'notification', data: { ...e.notification, sound: e.delivery.sound, priority: e.delivery.priority } })),
+      ),
+      interval(25000).pipe(map(() => ({ type: 'ping', data: { t: Date.now() } }))),
+    );
+  }
+
+  async getPrefs(userId: string): Promise<NotificationPrefs> {
+    const user: any = await this.userModel.findOne({ user_id: userId }).select('notification_prefs').lean().exec();
+    return prefsOf(user);
+  }
+
+  async updatePrefs(userId: string, changes: Partial<NotificationPrefs>): Promise<NotificationPrefs> {
+    const set: Record<string, boolean> = {};
+    for (const k of Object.keys(DEFAULT_PREFS) as (keyof NotificationPrefs)[]) {
+      if (typeof changes[k] === 'boolean') set[`notification_prefs.${k}`] = changes[k] as boolean;
+    }
+    if (Object.keys(set).length) await this.userModel.updateOne({ user_id: userId }, { $set: set }).exec();
+    return this.getPrefs(userId);
+  }
 
   /**
    * Remplace l'ancien index unique « sparse » (user_id, dedupe_key), qui n'autorisait
@@ -152,16 +184,43 @@ export class NotificationsService implements OnModuleInit {
     );
   }
 
-  /** Relaie une notification fraîchement créée en push FCM, sans jamais bloquer ni échouer. */
+  /**
+   * Livre une notification fraîchement créée : en direct aux apps ouvertes (SSE) et en push FCM,
+   * avec le son signature sauf heures calmes, préférence coupée ou rafale sociale. Ne bloque jamais.
+   */
   private pushSafely(userId: string, n: ReturnType<NotificationsService['toDto']>): void {
-    if (!this.pushService.enabled || IN_APP_ONLY_TYPES.includes(n.type)) return;
     (async () => {
+      const [user, recentSocial] = await Promise.all([
+        this.userModel.findOne({ user_id: userId }).select('notification_prefs utc_offset_minutes').lean().exec() as Promise<any>,
+        SOCIAL_TYPES.includes(n.type)
+          ? this.notificationModel
+              .countDocuments({
+                user_id: userId,
+                type: { $in: SOCIAL_TYPES },
+                id: { $ne: n.id },
+                created_at: { $gte: new Date(Date.now() - SOCIAL_BURST_WINDOW_MS) },
+              })
+              .exec()
+          : Promise.resolve(0),
+      ]);
+      const delivery = decideDelivery(n, { prefs: prefsOf(user), utcOffsetMinutes: user?.utc_offset_minutes, recentSocial });
+      this.live$.next({ userId, notification: n, delivery });
+      if (!this.pushService.enabled || IN_APP_ONLY_TYPES.includes(n.type) || !delivery.push) return;
       await this.pushService.sendToUser(userId, {
         title: n.title,
         body: n.body,
         imageUrl: n.data?.image_url,
+        sound: delivery.sound,
+        collapseKey: delivery.collapse_key,
+        threadId: delivery.priority === 'social' ? 'social' : n.type,
         // L'app lit « payload » pour ouvrir le bon écran, comme depuis la cloche
-        data: { notification_id: n.id, type: n.type, payload: n.data },
+        data: {
+          notification_id: n.id,
+          type: n.type,
+          payload: n.data,
+          sound: delivery.sound ? '1' : '0',
+          priority: delivery.priority,
+        },
       });
     })().catch((err) => this.logger.warn(`Push non envoyé à ${userId}: ${err.message}`));
   }
@@ -183,10 +242,12 @@ export class NotificationsService implements OnModuleInit {
     const n = this.toDto(doc.toObject());
     const deviceList = await this.pushService.describeDevices(userId);
     const devices = deviceList.length;
+    this.live$.next({ userId, notification: n, delivery: { push: true, sound: true, priority: 'important' } });
     const push = await this.pushService.sendToUser(userId, {
       title: n.title,
       body: n.body,
-      data: { notification_id: n.id, type: n.type, payload: n.data },
+      sound: true,
+      data: { notification_id: n.id, type: n.type, payload: n.data, sound: '1', priority: 'important' },
     });
     return { notification: n, push_enabled: this.pushService.enabled, devices, device_list: deviceList, ...push };
   }

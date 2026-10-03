@@ -7,11 +7,12 @@ import * as admin from 'firebase-admin';
 import { DeviceToken, DeviceTokenDocument, DevicePlatform } from '../schemas/device-token.schema';
 import { User, UserDocument } from '../../auth/schemas/user.schema';
 import { GLOBAL_DB_CONNECTION } from '../../common/constants';
+import { ANDROID_QUIET_CHANNEL, ANDROID_SIGNATURE_CHANNEL, IOS_SIGNATURE_SOUND, SIGNATURE_SOUND } from '../notification-policy';
 
 /** Nombre maximal d'appareils gardés par compte (les plus anciens sont oubliés). */
 const MAX_DEVICES_PER_USER = 10;
 
-/** Canal Android déclaré par l'app (doit correspondre à celui créé côté Flutter). */
+/** Canal Android historique (anciennes versions de l'app) */
 export const ANDROID_CHANNEL_ID = 'voyagooo_alerts';
 
 /** Erreurs FCM signifiant que le jeton est mort : on le supprime. */
@@ -28,6 +29,12 @@ export interface PushMessage {
   /** Pastille de l'icône iOS (nombre de notifications non lues) */
   badge?: number;
   imageUrl?: string | null;
+  /** Son signature Voyagooo (sinon notification silencieuse) */
+  sound?: boolean;
+  /** Les push de même clé se remplacent au lieu de s'empiler (ex. commentaires d'un même voyage) */
+  collapseKey?: string;
+  /** Regroupement iOS dans le centre de notifications */
+  threadId?: string;
 }
 
 /**
@@ -159,7 +166,9 @@ export class PushService implements OnModuleInit {
     const data = this.stringifyData(message.data);
     const image = message.imageUrl && /^https:\/\//.test(message.imageUrl) ? message.imageUrl : undefined;
 
-    const aps: Record<string, any> = { sound: 'default' };
+    const withSound = message.sound !== false;
+    const aps: Record<string, any> = withSound ? { sound: IOS_SIGNATURE_SOUND } : {};
+    if (message.threadId) aps['thread-id'] = message.threadId;
     if (typeof message.badge === 'number') aps.badge = message.badge;
     if (image) aps['mutable-content'] = 1;
 
@@ -170,10 +179,18 @@ export class PushService implements OnModuleInit {
         data,
         android: {
           priority: 'high',
-          notification: { channelId: ANDROID_CHANNEL_ID, sound: 'default' },
+          ...(message.collapseKey ? { collapseKey: message.collapseKey } : {}),
+          notification: {
+            channelId: withSound ? ANDROID_SIGNATURE_CHANNEL : ANDROID_QUIET_CHANNEL,
+            ...(withSound ? { sound: SIGNATURE_SOUND } : {}),
+            ...(message.collapseKey ? { tag: message.collapseKey } : {}),
+          },
         },
         apns: {
-          headers: { 'apns-priority': '10' },
+          headers: {
+            'apns-priority': '10',
+            ...(message.collapseKey ? { 'apns-collapse-id': message.collapseKey } : {}),
+          },
           payload: { aps },
           ...(image ? { fcmOptions: { imageUrl: image } } : {}),
         },
