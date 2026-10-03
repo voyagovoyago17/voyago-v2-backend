@@ -234,6 +234,12 @@ export class TripBookingsService {
       destination_code: flight?.destination.code ?? null,
       offers: flight?.offers ?? [],
       cheaper_dates: (flight?.cheaper_dates ?? []).map((o) => ({ ...o, saving: best ? (best.price - o.price) * passengers : null })),
+      // Comparatif : repères, ± 3 jours, aéroports proches, verdict sur le prix
+      highlights: flight?.highlights ?? [],
+      flexible: (flight?.flexible ?? []).map((f) => ({ ...f, saving: best ? (best.price - f.price) * passengers : null })),
+      nearby: (flight?.nearby ?? []).map((n) => ({ ...n, saving: best ? (best.price - n.price) * passengers : null })),
+      insight: flight?.insight ?? null,
+      passengers,
       live_prices: !!flight,
       outside_budget: true,
       choices: [{ partner: 'aviasales', label: 'Aviasales', url: flight?.search_link || this.flightsUrl(home, where, startDate, returnDate, adults, kids.length) }],
@@ -293,6 +299,70 @@ export class TripBookingsService {
       ? Math.round(estimates.meals_per_person_per_day * days * shares)
       : allocation.meals;
 
+    // Pass touristique ou billets à l'unité : le moins cher pour ce groupe et cet itinéraire
+    const passCompare = this.comparePass(estimates?.city_pass, activities, adults, kids);
+
+    // Le meilleur plan : coût estimé sur place, vols, et économies possibles classées
+    const lodgingNeed = staysDto.reduce(
+      (s, x) => s + (x.nightly_min != null ? Math.round(((x.nightly_min + (x.nightly_max ?? x.nightly_min)) / 2) * x.nights) : x.nightly_budget * x.nights),
+      0,
+    );
+    const activitiesNeed = activities.reduce((s, a) => s + a.price_group, 0) - (passCompare?.worth_it ? passCompare.saving : 0);
+    const localNeed = local ? Math.round(local.price_per_day * days * Math.max(1, adults)) : 0;
+    const costOnSite = lodgingNeed + activitiesNeed + meals + localNeed;
+    const flightsGroup = best ? best.price * passengers : null;
+    const savings: { kind: string; title: string; detail: string; amount: number; tab: number }[] = [];
+    for (const x of staysDto) {
+      const cheapest = x.options.find((o) => o.fits_budget) ?? x.options[0];
+      if (!cheapest || x.nightly_min == null) continue;
+      const ideal = ((x.nightly_min + (x.nightly_max ?? x.nightly_min)) / 2) * x.nights;
+      const alt = ((cheapest.nightly_min + cheapest.nightly_max) / 2) * x.nights;
+      if (ideal - alt > Math.max(20, ideal * 0.08)) {
+        savings.push({
+          kind: 'lodging',
+          title: `${cheapest.kind} à ${cheapest.area}`,
+          detail: `${x.nights} nuit${x.nights > 1 ? 's' : ''} au lieu de ${x.area}`,
+          amount: Math.round(ideal - alt),
+          tab: 1,
+        });
+      }
+    }
+    if (passCompare?.worth_it) {
+      savings.push({ kind: 'pass', title: `Prendre le ${passCompare.name}`, detail: `Couvre ${passCompare.covers.length} visites de ton itinéraire`, amount: passCompare.saving, tab: 3 });
+    }
+    const bestFlex = (flight?.flexible ?? []).filter((f) => best && f.price < best.price).sort((a, b) => a.price - b.price)[0];
+    if (bestFlex && best) {
+      savings.push({
+        kind: 'flight_dates',
+        title: `Partir le ${this.frDate(bestFlex.departure)}`,
+        detail: `Même durée de séjour${bestFlex.return ? `, retour le ${this.frDate(bestFlex.return)}` : ''}`,
+        amount: (best.price - bestFlex.price) * passengers,
+        tab: 2,
+      });
+    }
+    const bestNear = flight?.nearby[0];
+    if (bestNear && best) {
+      savings.push({
+        kind: 'flight_airport',
+        title: `Vol ${bestNear.origin} → ${bestNear.destination}`,
+        detail: 'Aéroport voisin, même période',
+        amount: (best.price - bestNear.price) * passengers,
+        tab: 2,
+      });
+    }
+    savings.sort((a, b) => b.amount - a.amount);
+    const plan = {
+      cost_on_site: costOnSite,
+      budget_total: total,
+      fits: costOnSite <= total,
+      gap: costOnSite - total,
+      flights_group: flightsGroup,
+      total_with_flights: flightsGroup != null ? costOnSite + flightsGroup : null,
+      savings: savings.filter((x) => x.amount > 0).slice(0, 4),
+      money_tips: estimates?.money_tips ?? [],
+      booking_window: estimates?.booking_window ?? null,
+    };
+
     const daily = this.buildDaily(trip, staysDto, activities, startDate, {
       days,
       shares,
@@ -351,6 +421,8 @@ export class TripBookingsService {
       daily,
       transport,
       activities,
+      pass_compare: passCompare,
+      plan,
       bookings: booked.sort((a, b) => String(b.created_at).localeCompare(String(a.created_at))),
       estimates_available: !!estimates,
     };
@@ -435,6 +507,30 @@ export class TripBookingsService {
     return out;
   }
 
+  /** Pass touristique comparé aux billets à l'unité des visites qu'il couvre */
+  private comparePass(
+    pass: BookingEstimatesDraft['city_pass'],
+    activities: { name: string; price_group: number }[],
+    adults: number,
+    kids: number[],
+  ) {
+    if (!pass) return null;
+    const norm = (v: string) => v.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+    const covered = activities.filter((a) => pass.covers.some((c) => norm(c) === norm(a.name) || norm(a.name).includes(norm(c)) || norm(c).includes(norm(a.name))));
+    if (covered.length < 2) return null;
+    const individual = covered.reduce((s, a) => s + a.price_group, 0);
+    const priceGroup = Math.round(pass.price_adult * adults + (pass.price_child ?? pass.price_adult) * kids.length);
+    return {
+      name: pass.name,
+      price_group: priceGroup,
+      covers: covered.map((a) => a.name),
+      individual_total: individual,
+      saving: individual - priceGroup,
+      worth_it: individual - priceGroup > 0,
+      tip: pass.tip ?? null,
+    };
+  }
+
   private async withTimeout<T>(p: Promise<T>, ms: number): Promise<T | null> {
     let timer: NodeJS.Timeout | undefined;
     try {
@@ -495,8 +591,8 @@ export class TripBookingsService {
     kids: number[],
     nightlyCap: number,
   ): Promise<BookingEstimatesDraft | null> {
-    // v2 : options d'hébergement sous le plafond
-    const basis = ['v2', trip.start_date || '', trip.duration_days, level, currency, adults, kids.join('.'), stays.length, nightlyCap].join('|');
+    // v3 : options d'hébergement, pass touristique, astuces
+    const basis = ['v3', trip.start_date || '', trip.duration_days, level, currency, adults, kids.join('.'), stays.length, nightlyCap].join('|');
     if (trip.bookings_plan?.basis === basis && trip.bookings_plan?.estimates) return trip.bookings_plan.estimates;
 
     const key = `${userId}:${trip.id}:${basis}`;

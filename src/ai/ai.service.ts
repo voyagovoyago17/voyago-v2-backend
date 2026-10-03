@@ -178,6 +178,12 @@ export interface BookingEstimatesDraft {
   activities: { name: string; price_adult: number; price_child?: number; advice?: string }[];
   local_transport?: { name: string; price_per_day: number; tip?: string };
   meals_per_person_per_day?: number;
+  /** Pass touristique de la ville, à comparer aux billets à l'unité */
+  city_pass?: { name: string; price_adult: number; price_child?: number; covers: string[]; tip?: string };
+  /** Astuces concrètes pour dépenser moins sur place */
+  money_tips?: string[];
+  /** Quand réserver l'hébergement pour ces dates */
+  booking_window?: string;
 }
 
 const BOOKING_ESTIMATES_SCHEMA: ResponseSchema = {
@@ -235,6 +241,19 @@ const BOOKING_ESTIMATES_SCHEMA: ResponseSchema = {
       required: ['name', 'price_per_day'],
     },
     meals_per_person_per_day: { type: SchemaType.NUMBER },
+    city_pass: {
+      type: SchemaType.OBJECT,
+      properties: {
+        name: { type: SchemaType.STRING },
+        price_adult: { type: SchemaType.NUMBER },
+        price_child: { type: SchemaType.NUMBER },
+        covers: { type: SchemaType.ARRAY, items: { type: SchemaType.STRING } },
+        tip: { type: SchemaType.STRING },
+      },
+      required: ['name', 'price_adult', 'covers'],
+    },
+    money_tips: { type: SchemaType.ARRAY, items: { type: SchemaType.STRING } },
+    booking_window: { type: SchemaType.STRING },
   },
   required: ['stays', 'activities'],
 };
@@ -808,9 +827,11 @@ Réponds avec UNIQUEMENT un objet JSON : {"suggestions":[{"destination":"...","c
     nightly_cap?: number;
   }): Promise<BookingEstimatesDraft | null> {
     const kids = input.children_ages.length ? `, enfants de ${input.children_ages.join(', ')} ans` : '';
-    const prompt = `Tu es Voyago, expert des réservations de voyage et du budget. Donne des estimations RÉALISTES et prudentes en ${input.currency}.
+    const month = input.start_date ? new Date(`${input.start_date.slice(0, 10)}T12:00:00Z`).toLocaleDateString('fr-FR', { month: 'long' }) : null;
+    const prompt = `Tu es Voyago, conseiller voyage local qui aide à réserver malin. Donne des estimations RÉALISTES et prudentes en ${input.currency}, telles qu'on les trouve en ligne${month ? ` en ${month} (tiens compte de la saison : haute, basse, événements)` : ''}.
 Voyage : ${input.destination}${input.country ? ` (${input.country})` : ''}, standing ${input.level}${input.start_date ? `, départ le ${input.start_date}` : ''}.
-Voyageurs : ${input.adults} adulte(s)${kids}. Déplacements : ${input.transports.join(', ') || 'marche'}.
+Voyageurs : ${input.adults} adulte(s)${kids}. Déplacements : ${input.transports.join(', ') || 'marche'}.${input.nightly_cap ? `
+Budget hébergement du voyageur : ${input.nightly_cap} ${input.currency} la nuit pour tout le groupe.` : ''}
 
 Étapes d'hébergement (index, jours, lieux visités à proximité) :
 ${input.stays.map((s) => `- ${s.index} · ${s.days} · ${s.near.slice(0, 4).join(', ')}`).join('\n')}
@@ -818,12 +839,15 @@ ${input.stays.map((s) => `- ${s.index} · ${s.days} · ${s.near.slice(0, 4).join
 Lieux de l'itinéraire : ${input.places.slice(0, 20).join(' ; ')}
 
 Réponds :
-- "stays" : pour chaque étape, le quartier idéal où dormir ("area", nom réel), "why" (1 phrase, 15 mots max : proximité, ambiance, sécurité, famille), "nightly_min"/"nightly_max" = prix réaliste d'une nuit pour TOUT le groupe au standing ${input.level}, "tip" (conseil de réservation, 12 mots max).
-  Ajoute "options" : 3 AUTRES façons de dormir pour cette étape, variées (ex : pension familiale, appartement, auberge avec chambre privée, hôtel 3★, maison d'hôtes), chacune avec "kind" (type, 4 mots max), "area" (quartier réel, voisin si moins cher), "nightly_min"/"nightly_max" (tout le groupe) et "why" (12 mots max).${input.nightly_cap ? ` Le plafond du voyageur est de ${input.nightly_cap} ${input.currency} la nuit : au moins 2 options doivent tenir SOUS ce plafond.` : ''}
-- "activities" : uniquement les lieux PAYANTS de la liste (nom exact), "price_adult" et "price_child" (0 si gratuit pour les enfants), "advice" (ex : "Réserver en ligne : file d'attente évitée", 10 mots max). Omets les lieux gratuits et les restaurants.
+- "stays" : pour chaque étape, le quartier idéal où dormir ("area", nom réel), "why" (1 phrase, 15 mots max : proximité des lieux du jour, ambiance, sécurité${input.children_ages.length ? ', adapté aux enfants' : ''}), "nightly_min"/"nightly_max" = prix réaliste d'une nuit pour TOUT le groupe (${input.adults + input.children_ages.length} personnes, nombre de chambres adapté) au standing ${input.level}, "tip" (conseil de réservation concret, 12 mots max).
+  Ajoute "options" : 3 AUTRES façons de dormir pour cette étape, variées (ex : pension familiale, appartement, auberge avec chambre privée, hôtel 3★, maison d'hôtes), chacune avec "kind" (type, 4 mots max), "area" (quartier réel, voisin si moins cher et bien desservi), "nightly_min"/"nightly_max" (tout le groupe) et "why" (12 mots max : ce qu'on gagne, ce qu'on sacrifie).${input.nightly_cap ? ` Au moins 2 options doivent tenir SOUS ${input.nightly_cap} ${input.currency} la nuit.` : ''}
+- "activities" : uniquement les lieux PAYANTS de la liste (nom exact), "price_adult" et "price_child" (0 si gratuit pour les enfants) au tarif officiel, "advice" (ex : "Réserver en ligne : file d'attente évitée", "Gratuit le 1er dimanche", 10 mots max). Omets les lieux gratuits et les restaurants.
 - "local_transport" : le meilleur pass ou mode local (nom réel, ex : carte Navegante, Suica), "price_per_day" par personne, "tip".
 - "meals_per_person_per_day" : budget repas réaliste par adulte et par jour au standing ${input.level}.
-N'invente jamais de remise ni de partenariat. Réponds avec UNIQUEMENT l'objet JSON.`;
+- "city_pass" : SEULEMENT s'il existe un vrai pass touristique couvrant plusieurs lieux payants de la liste (nom réel, ex : Paris Museum Pass, Roma Pass) : "price_adult", "price_child", "covers" (noms EXACTS des lieux de la liste inclus), "tip". Sinon omets le champ.
+- "money_tips" : 3 astuces concrètes et locales pour dépenser moins pendant CE voyage (jours gratuits, menus du midi, transports, quartiers), 14 mots max chacune.
+- "booking_window" : quand réserver l'hébergement pour ces dates (ex : "Réserve 6 à 8 semaines avant : forte demande en juillet"), 14 mots max.
+N'invente jamais de remise, de prix promotionnel ni de partenariat. Réponds avec UNIQUEMENT l'objet JSON.`;
 
     const parse = (text: string): BookingEstimatesDraft | null => {
       const raw = JSON.parse(text.replace(/```json/g, '').replace(/```/g, '').trim());
@@ -868,6 +892,21 @@ N'invente jamais de remise ni de partenariat. Réponds avec UNIQUEMENT l'objet J
               }
             : undefined,
         meals_per_person_per_day: num(raw.meals_per_person_per_day) || undefined,
+        city_pass:
+          raw.city_pass && typeof raw.city_pass.name === 'string' && num(raw.city_pass.price_adult) > 0 && Array.isArray(raw.city_pass.covers)
+            ? {
+                name: raw.city_pass.name.trim().slice(0, 60),
+                price_adult: num(raw.city_pass.price_adult),
+                price_child: num(raw.city_pass.price_child),
+                covers: raw.city_pass.covers.filter((c: any) => typeof c === 'string').map((c: string) => c.trim().slice(0, 80)).slice(0, 15),
+                tip: raw.city_pass.tip ? String(raw.city_pass.tip).trim().slice(0, 100) : undefined,
+              }
+            : undefined,
+        money_tips: (Array.isArray(raw.money_tips) ? raw.money_tips : [])
+          .filter((t: any) => typeof t === 'string' && t.trim())
+          .map((t: string) => t.trim().slice(0, 120))
+          .slice(0, 3),
+        booking_window: raw.booking_window ? String(raw.booking_window).trim().slice(0, 120) : undefined,
       };
     };
 
