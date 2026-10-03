@@ -9,6 +9,7 @@ import { User, UserDocument } from '../auth/schemas/user.schema';
 import { GLOBAL_DB_CONNECTION } from '../common/constants';
 import { TripDocument, TripSchema } from './schemas/trip.schema';
 import { distanceMeters } from './trip-gems.service';
+import { TravelpayoutsService } from './travelpayouts.service';
 
 /** Budget par personne et par jour quand le voyageur n'a pas annoncé de montant (EUR) */
 const DAILY_BUDGET_BY_LEVEL: Record<string, number> = { economique: 70, moyen: 140, luxe: 320 };
@@ -40,6 +41,7 @@ export class TripBookingsService {
     private readonly tenancyService: TenancyService,
     private readonly aiService: AiService,
     private readonly config: ConfigService,
+    private readonly travelpayouts: TravelpayoutsService,
     @InjectModel(User.name, GLOBAL_DB_CONNECTION) private readonly userModel: Model<UserDocument>,
   ) {}
 
@@ -51,7 +53,7 @@ export class TripBookingsService {
     const TripModel = await this.tripModel(userId);
     const trip: any = await TripModel.findOne({ id: tripId, user_id: userId })
       .select(
-        'id destination city country duration_days start_date budget budget_amount currency travelers transports pois bookings_plan bookings cover_image_url',
+        'id destination city country duration_days start_date budget budget_amount currency travelers transports pois weather bookings_plan bookings cover_image_url',
       )
       .lean()
       .exec();
@@ -89,9 +91,20 @@ export class TripBookingsService {
     };
 
     const stays = this.buildStays(trip);
-    const estimates = await this.estimates(userId, trip, stays, level, currency, adults, kids);
-
     const startDate = this.parseDay(trip.start_date);
+    const home = user?.city || user?.country;
+    const where = trip.city || trip.destination;
+    const returnDate = startDate ? this.addDays(startDate, days - 1) : null;
+    // Estimations IA et vrais prix des vols en parallèle (le vol ne bloque jamais l'écran)
+    const [estimates, flight] = await Promise.all([
+      this.estimates(userId, trip, stays, level, currency, adults, kids),
+      home
+        ? this.withTimeout(
+            this.travelpayouts.flightQuote({ from: home, to: where, departure: startDate, returnDate, currency, adults, kids }),
+            9000,
+          )
+        : Promise.resolve(null),
+    ]);
     const lodgingNightCap = nights ? Math.round(allocation.lodging / nights) : 0;
 
     const staysDto = stays.map((stay) => {
@@ -162,14 +175,23 @@ export class TripBookingsService {
         link: `https://www.google.com/maps/search/location+de+v%C3%A9los/@${center.lat},${center.lng},14z`,
       });
     }
-    const home = user?.city || user?.country;
+    // Vols : vrais prix Aviasales (Travelpayouts) quand on connaît la ville de départ, sinon comparateur
+    const passengers = adults + kids.filter((a) => a >= 2).length;
+    const best = flight?.offers[0] ?? null;
     transport.unshift({
       kind: 'flight',
-      title: home ? `${home} → ${trip.city || trip.destination}` : `Vols vers ${trip.city || trip.destination}`,
+      title: home ? `${home} → ${where}` : `Vols vers ${where}`,
       subtitle: startDate
-        ? `Aller le ${this.frDate(startDate)} · retour le ${this.frDate(this.addDays(startDate, days - 1))}`
+        ? `Aller le ${this.frDate(startDate)} · retour le ${this.frDate(returnDate!)}`
         : 'Ajoute tes dates pour comparer les vols',
-      link: this.flightsUrl(home, trip.city || trip.destination, startDate, startDate ? this.addDays(startDate, days - 1) : null, adults, kids.length),
+      link: flight?.search_link || this.flightsUrl(home, where, startDate, returnDate, adults, kids.length),
+      price: best ? best.price * passengers : undefined,
+      price_label: best ? `dès ${best.price} ${currency}/pers. aller-retour` : undefined,
+      origin_code: flight?.origin.code ?? null,
+      destination_code: flight?.destination.code ?? null,
+      offers: flight?.offers ?? [],
+      cheaper_dates: (flight?.cheaper_dates ?? []).map((o) => ({ ...o, saving: best ? (best.price - o.price) * passengers : null })),
+      live_prices: !!flight,
       outside_budget: true,
     });
 
@@ -192,6 +214,28 @@ export class TripBookingsService {
     const meals = estimates?.meals_per_person_per_day
       ? Math.round(estimates.meals_per_person_per_day * days * shares)
       : allocation.meals;
+
+    const daily = this.buildDaily(trip, staysDto, activities, startDate, {
+      days,
+      shares,
+      adults,
+      mealsPerPersonDay: estimates?.meals_per_person_per_day ?? Math.round(allocation.meals / days / shares),
+      localPerDay: local ? Math.round(local.price_per_day * Math.max(1, adults)) : 0,
+      dailyBudget: Math.round(total / days),
+    });
+
+    // Liens partenaires affiliés (Booking.com, GetYourGuide…) quand le projet Travelpayouts est configuré
+    const links = await this.withTimeout(
+      this.travelpayouts.affiliate([
+        ...staysDto.map((x) => x.links.booking),
+        ...activities.map((a) => a.link),
+      ]),
+      4000,
+    );
+    if (links) {
+      for (const x of staysDto) x.links.booking = links[x.links.booking] || x.links.booking;
+      for (const a of activities) a.link = links[a.link] || a.link;
+    }
 
     const booked = (trip.bookings || []) as any[];
     const spent = booked.filter((b) => b.category !== 'flights').reduce((sum, b) => sum + (Number(b.amount) || 0), 0);
@@ -229,6 +273,7 @@ export class TripBookingsService {
         },
       },
       stays: staysDto,
+      daily,
       transport,
       activities,
       bookings: booked.sort((a, b) => String(b.created_at).localeCompare(String(a.created_at))),
@@ -263,6 +308,67 @@ export class TripBookingsService {
     const TripModel = await this.tripModel(userId);
     await TripModel.updateOne({ id: tripId, user_id: userId }, { $pull: { bookings: { id: itemId } } }).exec();
     return this.get(userId, tripId);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Jour par jour : où l'on dort, ce qu'on visite, ce que ça coûte
+  // ---------------------------------------------------------------------------
+
+  private buildDaily(
+    trip: any,
+    stays: { from_day: number; to_day: number; nights: number; area: string; nightly_min: number | null; nightly_max: number | null; nightly_budget: number }[],
+    activities: { name: string; day: number | null; price_group: number }[],
+    startDate: string | null,
+    o: { days: number; shares: number; adults: number; mealsPerPersonDay: number; localPerDay: number; dailyBudget: number },
+  ) {
+    const pois: any[] = trip.pois || [];
+    const weather: any[] = trip.weather || [];
+    const out: any[] = [];
+    for (let d = 1; d <= o.days; d++) {
+      const date = startDate ? this.addDays(startDate, d - 1) : null;
+      const stay = stays.find((s) => d >= s.from_day && d <= s.to_day);
+      // On dort sur place tous les soirs sauf le dernier
+      const sleeps = d < o.days && !!stay;
+      const lodging = sleeps
+        ? stay!.nightly_min != null
+          ? Math.round((stay!.nightly_min + (stay!.nightly_max ?? stay!.nightly_min)) / 2)
+          : stay!.nightly_budget
+        : 0;
+      const dayPois = pois.filter((p) => p.day === d).sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+      const paid = activities.filter((a) => a.day === d);
+      const activitiesCost = paid.reduce((s, a) => s + a.price_group, 0);
+      const meals = Math.round(o.mealsPerPersonDay * o.shares);
+      const transport = o.localPerDay;
+      const w = date ? weather.find((x) => x?.date === date) : weather[d - 1];
+      const totalDay = lodging + activitiesCost + meals + transport;
+      out.push({
+        day: d,
+        date,
+        area: stay?.area ?? null,
+        sleeps,
+        weather: w ? { icon: w.icon ?? null, temp_max: w.temp_max ?? null, temp_min: w.temp_min ?? null, summary: w.summary ?? null } : null,
+        places: dayPois.map((p) => ({
+          name: p.name,
+          price: paid.find((a) => a.name.toLowerCase() === String(p.name).toLowerCase())?.price_group ?? 0,
+          duration_minutes: p.duration_minutes ?? null,
+        })),
+        costs: { lodging, activities: activitiesCost, meals, transport },
+        total: totalDay,
+        budget: o.dailyBudget,
+      });
+    }
+    return out;
+  }
+
+  private async withTimeout<T>(p: Promise<T>, ms: number): Promise<T | null> {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([p, new Promise<null>((resolve) => (timer = setTimeout(() => resolve(null), ms)))]);
+    } catch {
+      return null;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   // ---------------------------------------------------------------------------
