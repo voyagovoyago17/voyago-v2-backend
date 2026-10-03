@@ -278,6 +278,108 @@ export class TravelpayoutsService {
     }
   }
 
+  /** Meilleur prix aller-retour (par adulte) aux dates exactes, pour l'alerte prix. Null si rien en cache. */
+  async bestPrice(origin: string, destination: string, departure: string, back: string | null, currency: string) {
+    const rows = await this.safe(this.prices(origin, destination, departure, back, currency.toLowerCase(), 30));
+    const prices = rows.map((r: any) => Math.round(Number(r.price) || 0)).filter((x) => x > 0);
+    return prices.length ? Math.min(...prices) : null;
+  }
+
+  /** Lien Aviasales pré-rempli pour le groupe (alerte prix, inspiration) */
+  routeLink(origin: string, destination: string, departure: string | null, back: string | null, adults: number, kids: number[]) {
+    return this.searchLink(origin, destination, departure, back, this.paxBlock(adults, kids));
+  }
+
+  /** Noms des villes par code IATA (data/fr/cities.json), gardés une semaine */
+  private async cityNames(): Promise<Record<string, { name: string; country: string }>> {
+    return this.cached('cities:fr', 7 * 24 * 3600_000, async () => {
+      try {
+        const res = await axios.get('https://api.travelpayouts.com/data/fr/cities.json', { timeout: 8000 });
+        const map: Record<string, { name: string; country: string }> = {};
+        for (const c of res.data || []) {
+          if (c?.code) map[c.code] = { name: c.name || c.name_translations?.en || c.code, country: c.country_code || '' };
+        }
+        return map;
+      } catch {
+        return {};
+      }
+    });
+  }
+
+  /**
+   * Inspiration : destinations les moins chères depuis la ville du voyageur (aller-retour, par adulte),
+   * filtrées par prix maximum si donné. Sources : v1/city-directions et v3/search_by_price_range.
+   */
+  async inspiration(o: { from: string; currency: string; maxPrice?: number; adults: number; kids: number[] }) {
+    if (!this.enabled) return null;
+    const origin = await this.cityCode(o.from);
+    if (!origin) return null;
+    const currency = o.currency.toLowerCase();
+    const [directions, ranged, names] = await Promise.all([
+      this.safe(
+        this.cached<any[]>(`dirs:${this.market}:${origin.code}:${currency}`, PRICE_TTL_MS, async () => {
+          const res = await axios.get('https://api.travelpayouts.com/v1/city-directions', {
+            params: { origin: origin.code, currency, market: this.market, token: this.token },
+            timeout: 6000,
+          });
+          const data = res.data?.data;
+          return data && typeof data === 'object' ? Object.values(data) : [];
+        }),
+      ),
+      o.maxPrice
+        ? this.safe(
+            this.cached<any[]>(`range:${this.market}:${origin.code}:${currency}:${o.maxPrice}`, PRICE_TTL_MS, async () => {
+              const res = await axios.get('https://api.travelpayouts.com/aviasales/v3/search_by_price_range', {
+                params: {
+                  origin: origin.code,
+                  value_min: 1,
+                  value_max: Math.round(o.maxPrice!),
+                  one_way: false,
+                  limit: 60,
+                  currency,
+                  market: this.market,
+                  token: this.token,
+                },
+                timeout: 6000,
+              });
+              return Array.isArray(res.data?.data) ? res.data.data : [];
+            }),
+          )
+        : Promise.resolve([]),
+      this.cityNames(),
+    ]);
+
+    const today = new Date().toISOString().slice(0, 10);
+    const best = new Map<string, any>();
+    for (const r of [...directions, ...ranged]) {
+      const dest = String(r.destination || r.destination_code || '');
+      const price = Math.round(Number(r.price) || 0);
+      const dep = r.departure_at ? String(r.departure_at).slice(0, 10) : null;
+      if (!dest || !price || dest === origin.code) continue;
+      if (dep && dep < today) continue;
+      if (o.maxPrice && price > o.maxPrice) continue;
+      const prev = best.get(dest);
+      if (!prev || price < prev.price) {
+        const ret = r.return_at ? String(r.return_at).slice(0, 10) : null;
+        best.set(dest, {
+          code: dest,
+          city: names[dest]?.name || r.destination_name || dest,
+          country_code: names[dest]?.country || null,
+          price,
+          departure: dep,
+          return: ret,
+          transfers: Number(r.transfers ?? r.number_of_changes ?? 0),
+          link: this.routeLink(origin.code, dest, dep, ret, o.adults, o.kids),
+        });
+      }
+    }
+    return {
+      origin,
+      currency: o.currency,
+      items: [...best.values()].sort((a, b) => a.price - b.price).slice(0, 12),
+    };
+  }
+
   /** Repères du comparatif, sans doublon : une même offre peut cumuler plusieurs titres */
   private highlights(offers: FlightOffer[]): { kind: FlightHighlight; offer: FlightOffer }[] {
     if (!offers.length) return [];

@@ -3,7 +3,7 @@ import { Document } from 'mongoose';
 
 export type NotificationDocument = Notification & Document;
 
-export const NOTIFICATION_TYPES = ['arrival', 'trip_ready', 'review_thanks', 'system', 'comment', 'trip_remixed', 'tribe_trip', 'circle_request'] as const;
+export const NOTIFICATION_TYPES = ['arrival', 'trip_ready', 'review_thanks', 'system', 'comment', 'trip_remixed', 'tribe_trip', 'circle_request', 'price_drop'] as const;
 export type NotificationType = (typeof NOTIFICATION_TYPES)[number];
 
 @Schema({ collection: 'notifications', timestamps: { createdAt: 'created_at', updatedAt: false } })

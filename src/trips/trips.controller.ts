@@ -6,6 +6,7 @@ import {
   Delete,
   Body,
   Param,
+  Query,
   UseGuards,
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
@@ -23,6 +24,8 @@ import { TripPackingService } from './trip-packing.service';
 import { AddPackingItemDto, TogglePackingItemDto } from './dto/packing.dto';
 import { TripBookingsService } from './trip-bookings.service';
 import { AddTripBookingDto } from './dto/bookings.dto';
+import { PriceAlertService } from './price-alert.service';
+import { TravelpayoutsService } from './travelpayouts.service';
 
 @ApiTags('✈️ Voyages & Itinéraires IA')
 @Controller()
@@ -32,7 +35,39 @@ export class TripsController {
     private readonly tripGemsService: TripGemsService,
     private readonly tripPackingService: TripPackingService,
     private readonly tripBookingsService: TripBookingsService,
+    private readonly priceAlertService: PriceAlertService,
+    private readonly travelpayouts: TravelpayoutsService,
   ) {}
+
+  /** Inspiration budget : destinations les moins chères en avion depuis la ville du voyageur */
+  @ApiOperation({ summary: 'Inspiration : vols aller-retour les moins chers depuis ma ville (Aviasales)' })
+  @ApiBearerAuth()
+  @Get('flights/inspiration')
+  @UseGuards(SessionAuthGuard)
+  async flightInspiration(
+    @CurrentUser() user: any,
+    @Query('max_price') maxPrice?: string,
+    @Query('currency') currency?: string,
+    @Query('adults') adults?: string,
+    @Query('children_ages') childrenAges?: string,
+  ) {
+    const profile = await this.tripBookingsService.homeOf(user.user_id);
+    const empty = { origin: null, currency: currency || 'EUR', items: [] as any[], needs_city: !profile };
+    if (!profile) return empty;
+    const max = Number(maxPrice);
+    const kids = (childrenAges || '')
+      .split(',')
+      .map((x) => Number(x))
+      .filter((x) => Number.isFinite(x) && x >= 0 && x < 18);
+    const res = await this.travelpayouts.inspiration({
+      from: profile,
+      currency: /^[A-Z]{3}$/.test(currency || '') ? currency! : 'EUR',
+      maxPrice: Number.isFinite(max) && max > 0 ? max : undefined,
+      adults: Math.min(9, Math.max(1, Number(adults) || 1)),
+      kids,
+    });
+    return res ? { ...res, needs_city: false } : empty;
+  }
 
   @ApiOperation({ summary: 'Obtenir tous les voyages d’un utilisateur (privés et/ou publics)' })
   @ApiBearerAuth()
@@ -107,6 +142,27 @@ export class TripsController {
   @UseGuards(SessionAuthGuard)
   async removeBooking(@CurrentUser() user: any, @Param('trip_id') trip_id: string, @Param('item_id') item_id: string) {
     return this.tripBookingsService.remove(user.user_id, trip_id, item_id);
+  }
+
+  /** Alerte prix sur le vol du voyage */
+  @ApiOperation({ summary: 'Alerte prix du vol : état' })
+  @ApiBearerAuth()
+  @Get('trip/:trip_id/price-alert')
+  @UseGuards(SessionAuthGuard)
+  async getPriceAlert(@CurrentUser() user: any, @Param('trip_id') trip_id: string) {
+    return this.priceAlertService.status(user.user_id, trip_id);
+  }
+
+  @Post('trip/:trip_id/price-alert')
+  @UseGuards(SessionAuthGuard)
+  async enablePriceAlert(@CurrentUser() user: any, @Param('trip_id') trip_id: string) {
+    return this.priceAlertService.enable(user.user_id, trip_id);
+  }
+
+  @Delete('trip/:trip_id/price-alert')
+  @UseGuards(SessionAuthGuard)
+  async disablePriceAlert(@CurrentUser() user: any, @Param('trip_id') trip_id: string) {
+    return this.priceAlertService.disable(user.user_id, trip_id);
   }
 
   /** Ajouter ou changer les dates d'un voyage (la fin découle de la durée) */

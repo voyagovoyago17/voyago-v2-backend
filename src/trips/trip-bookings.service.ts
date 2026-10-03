@@ -10,6 +10,7 @@ import { GLOBAL_DB_CONNECTION } from '../common/constants';
 import { TripDocument, TripSchema } from './schemas/trip.schema';
 import { distanceMeters } from './trip-gems.service';
 import { TravelpayoutsService } from './travelpayouts.service';
+import { PriceAlertService } from './price-alert.service';
 import {
   AFFILIATE_PARTNERS,
   PartnerChoice,
@@ -51,6 +52,7 @@ export class TripBookingsService {
     private readonly aiService: AiService,
     private readonly config: ConfigService,
     private readonly travelpayouts: TravelpayoutsService,
+    private readonly priceAlerts: PriceAlertService,
     @InjectModel(User.name, GLOBAL_DB_CONNECTION) private readonly userModel: Model<UserDocument>,
   ) {}
 
@@ -107,6 +109,7 @@ export class TripBookingsService {
     const where = trip.city || trip.destination;
     const returnDate = startDate ? this.addDays(startDate, days - 1) : null;
     // Estimations IA et vrais prix des vols en parallèle (le vol ne bloque jamais l'écran)
+    const priceAlertPromise = this.priceAlerts.status(userId, tripId).catch(() => null);
     const [estimates, flight] = await Promise.all([
       this.estimates(userId, trip, stays, level, currency, adults, kids, lodgingNightCap),
       home
@@ -422,10 +425,17 @@ export class TripBookingsService {
       transport,
       activities,
       pass_compare: passCompare,
+      price_alert: await priceAlertPromise,
       plan,
       bookings: booked.sort((a, b) => String(b.created_at).localeCompare(String(a.created_at))),
       estimates_available: !!estimates,
     };
+  }
+
+  /** Ville (ou pays) de départ du voyageur, pour les vols */
+  async homeOf(userId: string): Promise<string | null> {
+    const user: any = await this.userModel.findOne({ user_id: userId }).select('city country').lean().exec();
+    return user?.city || user?.country || null;
   }
 
   // ---------------------------------------------------------------------------
