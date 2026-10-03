@@ -34,18 +34,46 @@ export class NotificationsService implements OnModuleInit {
    * qu'une seule notification sans clé par utilisateur, par l'index partiel du schéma.
    */
   async onModuleInit() {
+    this.migrateIndexes().catch((err) =>
+      this.logger.warn(`Index des notifications non migré : ${err.message}`),
+    );
+  }
+
+  private async migrateIndexes() {
+    // Attendre que la connexion Mongoose soit prête si nécessaire
+    if (this.notificationModel.db.readyState !== 1) {
+      await new Promise<void>((resolve) => {
+        this.notificationModel.db.once('open', () => resolve());
+      });
+    }
+
     try {
       const indexes = await this.notificationModel.collection.indexes();
-      const legacy = indexes.find((i) => i.name === 'user_id_1_dedupe_key_1');
-      if (legacy) {
-        await this.notificationModel.collection.dropIndex('user_id_1_dedupe_key_1');
-        this.logger.log('Ancien index unique des notifications supprimé');
+      for (const idx of indexes) {
+        // Supprimer l'ancien index unique sans partialFilterExpression
+        if (
+          idx.name === 'user_id_1_dedupe_key_1' ||
+          (idx.name !== DEDUPE_INDEX_NAME &&
+            idx.key?.user_id &&
+            idx.key?.dedupe_key &&
+            !idx.partialFilterExpression?.dedupe_key)
+        ) {
+          try {
+            await this.notificationModel.collection.dropIndex(idx.name);
+            this.logger.log(`Ancien index unique ${idx.name} des notifications supprimé avec succès`);
+          } catch (e: any) {
+            this.logger.warn(`Impossible de supprimer l'index ${idx.name} : ${e.message}`);
+          }
+        }
       }
-      if (!indexes.some((i) => i.name === DEDUPE_INDEX_NAME)) {
+
+      const refreshedIndexes = await this.notificationModel.collection.indexes();
+      if (!refreshedIndexes.some((i) => i.name === DEDUPE_INDEX_NAME)) {
         await this.notificationModel.collection.createIndex(
           { user_id: 1, dedupe_key: 1 },
           { name: DEDUPE_INDEX_NAME, unique: true, partialFilterExpression: { dedupe_key: { $type: 'string' } } },
         );
+        this.logger.log(`Nouvel index partiel ${DEDUPE_INDEX_NAME} créé`);
       }
     } catch (err: any) {
       this.logger.warn(`Index des notifications non migré : ${err.message}`);
@@ -77,13 +105,41 @@ export class NotificationsService implements OnModuleInit {
       this.pushSafely(userId, dto);
       return dto;
     } catch (err: any) {
-      // Course entre deux requêtes simultanées : l'index unique a gagné
-      if (err?.code === 11000 && input.dedupe_key) {
-        const existing = await this.notificationModel
-          .findOne({ user_id: userId, dedupe_key: input.dedupe_key })
-          .lean()
-          .exec();
-        if (existing) return this.toDto(existing);
+      if (err?.code === 11000) {
+        // Course entre deux requêtes simultanées : l'index unique a gagné
+        if (input.dedupe_key) {
+          const existing = await this.notificationModel
+            .findOne({ user_id: userId, dedupe_key: input.dedupe_key })
+            .lean()
+            .exec();
+          if (existing) return this.toDto(existing);
+        }
+
+        // L'ancien index user_id_1_dedupe_key_1 est encore présent et bloque les notifications sans clé (dedupe_key: null)
+        if (err?.message?.includes('user_id_1_dedupe_key_1') || err?.message?.includes('dedupe_key: null')) {
+          this.logger.warn(
+            `Détection de l'ancien index user_id_1_dedupe_key_1 lors d'une insertion. Suppression automatique à chaud...`,
+          );
+          try {
+            await this.notificationModel.collection.dropIndex('user_id_1_dedupe_key_1');
+            this.logger.log(`Index user_id_1_dedupe_key_1 supprimé à chaud. Réessai de l'insertion...`);
+            const retryDoc = await this.notificationModel.create({
+              id: uuidv4(),
+              user_id: userId,
+              type: input.type,
+              title: input.title,
+              body: input.body || '',
+              data: input.data || {},
+              read: false,
+              dedupe_key: input.dedupe_key,
+            });
+            const dto = this.toDto(retryDoc.toObject());
+            this.pushSafely(userId, dto);
+            return dto;
+          } catch (retryErr: any) {
+            this.logger.error(`Échec du réessai d'insertion: ${retryErr.message}`);
+          }
+        }
       }
       throw err;
     }
