@@ -7,6 +7,7 @@ import {
   Logger,
 } from '@nestjs/common';
 import { TripScheduleService } from './trip-schedule.service';
+import { TripBookingsService } from './trip-bookings.service';
 import { UpdateTripDatesDto } from './dto/update-trip-dates.dto';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
@@ -53,6 +54,7 @@ export class TripsService {
     private readonly tenancyService: TenancyService,
     private readonly notificationsService: NotificationsService,
     private readonly tripSchedule: TripScheduleService,
+    private readonly tripBookings: TripBookingsService,
   ) {}
 
   /**
@@ -111,6 +113,8 @@ export class TripsService {
     this.sharedTripModel.updateOne({ id: tripId }, { $set: set }).exec().catch(() => undefined);
     const updated: any = await TripModel.findOne({ id: tripId }).lean().exec();
     await this.tripSchedule.reset(userId, updated);
+    // Dates connues : Réservations & Budget se prépare en arrière-plan
+    this.tripBookings.warmUp(userId, tripId);
     return updated;
   }
 
@@ -542,6 +546,9 @@ export class TripsService {
       data: { trip_id: tripId, destination: dto.destination },
       dedupe_key: `trip_ready:${tripId}`,
     });
+
+    // Voyage daté : Réservations & Budget se prépare en arrière-plan (prêt à la première ouverture)
+    if (dto.start_date) this.tripBookings.warmUp(user.user_id, tripId);
 
     return trip;
   }

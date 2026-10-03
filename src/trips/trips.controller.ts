@@ -128,8 +128,8 @@ export class TripsController {
   @ApiBearerAuth()
   @Get('trip/:trip_id/bookings')
   @UseGuards(SessionAuthGuard)
-  async getBookings(@CurrentUser() user: any, @Param('trip_id') trip_id: string) {
-    return this.tripBookingsService.get(user.user_id, trip_id);
+  async getBookings(@CurrentUser() user: any, @Param('trip_id') trip_id: string, @Query('retry') retry?: string) {
+    return this.tripBookingsService.get(user.user_id, trip_id, { retry: retry === '1' || retry === 'true' });
   }
 
   @Post('trip/:trip_id/bookings')

@@ -31,6 +31,9 @@ const SPLIT_BY_LEVEL: Record<string, { lodging: number; transport: number; activ
   luxe: { lodging: 0.52, transport: 0.13, activities: 0.15, meals: 0.2 },
 };
 
+/** Échec ou résultat partiel de l'IA : pas de nouvel essai automatique pendant 10 min */
+const RECENT_TTL_MS = 10 * 60_000;
+
 /** Au-delà de cette distance entre deux journées, on change d'hébergement */
 const NEW_STAY_DISTANCE_M = 25000;
 
@@ -46,6 +49,8 @@ type BookingCategory = (typeof BOOKING_CATEGORIES)[number];
 export class TripBookingsService {
   private readonly logger = new Logger(TripBookingsService.name);
   private readonly pending = new Map<string, Promise<BookingEstimatesDraft | null>>();
+  /** Résultats partiels ou échecs récents : pas de nouvel essai avant 10 min (sauf « Réessayer ») */
+  private readonly recent = new Map<string, { at: number; value: BookingEstimatesDraft | null }>();
 
   constructor(
     private readonly tenancyService: TenancyService,
@@ -76,7 +81,11 @@ export class TripBookingsService {
   // Vue complète
   // ---------------------------------------------------------------------------
 
-  async get(userId: string, tripId: string) {
+  /**
+   * @param opts.wait  temps max d'attente des estimations IA avant de répondre (sinon « pending »)
+   * @param opts.retry relance l'IA même après un échec récent
+   */
+  async get(userId: string, tripId: string, opts: { wait?: number; retry?: boolean } = {}) {
     const trip = await this.loadTrip(userId, tripId);
     const user: any = await this.userModel.findOne({ user_id: userId }).select('city country').lean().exec();
     const choiceLists: PartnerChoice[][] = [];
@@ -110,15 +119,20 @@ export class TripBookingsService {
     const returnDate = startDate ? this.addDays(startDate, days - 1) : null;
     // Estimations IA et vrais prix des vols en parallèle (le vol ne bloque jamais l'écran)
     const priceAlertPromise = this.priceAlerts.status(userId, tripId).catch(() => null);
-    const [estimates, flight] = await Promise.all([
-      this.estimates(userId, trip, stays, level, currency, adults, kids, lodgingNightCap),
+    // Les estimations IA ne bloquent jamais l'écran : au-delà de quelques secondes, elles finissent en arrière-plan
+    const [estimated, flight] = await Promise.all([
+      this.estimates(userId, trip, stays, level, currency, adults, kids, lodgingNightCap, {
+        wait: opts.wait ?? 3500,
+        retry: !!opts.retry,
+      }),
       home
         ? this.withTimeout(
             this.travelpayouts.flightQuote({ from: home, to: where, departure: startDate, returnDate, currency, adults, kids }),
-            9000,
+            7000,
           )
         : Promise.resolve(null),
     ]);
+    const estimates = estimated.value;
 
     const staysDto = stays.map((stay) => {
       const est = estimates?.stays.find((s) => s.index === stay.index);
@@ -354,7 +368,8 @@ export class TripBookingsService {
       });
     }
     savings.sort((a, b) => b.amount - a.amount);
-    const plan = {
+    // Sans estimations, un « meilleur plan » serait trompeur : on attend qu'elles arrivent
+    const plan = !estimates ? null : {
       cost_on_site: costOnSite,
       budget_total: total,
       fits: costOnSite <= total,
@@ -377,7 +392,7 @@ export class TripBookingsService {
 
     // Liens affiliés Travelpayouts pour toutes les marques partenaires (les autres restent tels quels)
     const toConvert = choiceLists.flat().filter((c) => AFFILIATE_PARTNERS.has(c.partner)).map((c) => c.url);
-    const converted = await this.withTimeout(this.travelpayouts.affiliate(toConvert), 4500);
+    const converted = await this.withTimeout(this.travelpayouts.affiliate(toConvert), 3500);
     if (converted) {
       for (const c of choiceLists.flat()) c.url = converted[c.url] || c.url;
       for (const x of staysDto) x.links.booking = x.choices.find((c) => c.partner === 'booking')?.url || x.links.booking;
@@ -429,6 +444,8 @@ export class TripBookingsService {
       plan,
       bookings: booked.sort((a, b) => String(b.created_at).localeCompare(String(a.created_at))),
       estimates_available: !!estimates,
+      /** ready | pending (calcul en cours, l'app rafraîchit) | failed (bouton Réessayer) */
+      estimates_status: estimated.status,
     };
   }
 
@@ -590,7 +607,17 @@ export class TripBookingsService {
     });
   }
 
-  /** Estimations IA, calculées une fois par combinaison dates / groupe / budget puis gardées. */
+  /** Lance le calcul des estimations en arrière-plan (création du voyage, dates ajoutées) */
+  warmUp(userId: string, tripId: string) {
+    this.get(userId, tripId, { wait: 0 }).catch((err) =>
+      this.logger.warn(`Préparation des réservations ${tripId} : ${err.message}`),
+    );
+  }
+
+  /**
+   * Estimations IA, calculées une fois par combinaison dates / groupe / budget puis gardées.
+   * On attend au plus `wait` ms : au-delà, le calcul continue en arrière-plan (statut « pending »).
+   */
   private async estimates(
     userId: string,
     trip: any,
@@ -600,45 +627,73 @@ export class TripBookingsService {
     adults: number,
     kids: number[],
     nightlyCap: number,
-  ): Promise<BookingEstimatesDraft | null> {
+    opts: { wait: number; retry: boolean },
+  ): Promise<{ value: BookingEstimatesDraft | null; status: 'ready' | 'pending' | 'failed' }> {
     // v3 : options d'hébergement, pass touristique, astuces
     const basis = ['v3', trip.start_date || '', trip.duration_days, level, currency, adults, kids.join('.'), stays.length, nightlyCap].join('|');
-    if (trip.bookings_plan?.basis === basis && trip.bookings_plan?.estimates) return trip.bookings_plan.estimates;
+    if (trip.bookings_plan?.basis === basis && trip.bookings_plan?.estimates) {
+      return { value: trip.bookings_plan.estimates, status: 'ready' };
+    }
 
     const key = `${userId}:${trip.id}:${basis}`;
+    if (opts.retry) this.recent.delete(key);
+    const recent = this.recent.get(key);
+    if (recent && Date.now() - recent.at < RECENT_TTL_MS && !this.pending.has(key)) {
+      return { value: recent.value, status: recent.value ? 'ready' : 'failed' };
+    }
+
     if (!this.pending.has(key)) {
       this.pending.set(
         key,
         (async () => {
-          const estimates = await this.aiService.estimateBookings({
-            destination: trip.city || trip.destination,
-            country: trip.country,
-            level,
-            currency,
-            start_date: trip.start_date,
-            adults,
-            children_ages: kids,
-            stays: stays.map((s) => ({
-              index: s.index,
-              days: s.fromDay === s.toDay ? `jour ${s.fromDay}` : `jours ${s.fromDay} à ${s.toDay}`,
-              near: s.near,
-            })),
-            places: (trip.pois || []).filter((p: any) => p.order !== 2).map((p: any) => p.name),
-            transports: trip.transports || [],
-            nightly_cap: nightlyCap || undefined,
-          });
-          if (estimates) {
+          let estimates: (BookingEstimatesDraft & { partial?: boolean }) | null = null;
+          try {
+            estimates = await this.aiService.estimateBookings({
+              destination: trip.city || trip.destination,
+              country: trip.country,
+              level,
+              currency,
+              start_date: trip.start_date,
+              adults,
+              children_ages: kids,
+              stays: stays.map((s) => ({
+                index: s.index,
+                days: s.fromDay === s.toDay ? `jour ${s.fromDay}` : `jours ${s.fromDay} à ${s.toDay}`,
+                near: s.near,
+              })),
+              places: (trip.pois || []).filter((p: any) => p.order !== 2).map((p: any) => p.name),
+              transports: trip.transports || [],
+              nightly_cap: nightlyCap || undefined,
+            });
+          } catch (err: any) {
+            this.logger.warn(`Estimations ${trip.id} : ${err.message}`);
+          }
+          if (estimates && !estimates.partial) {
+            // Complet : gardé avec le voyage
+            const { partial, ...complete } = estimates;
             const TripModel = await this.tripModel(userId);
             await TripModel.updateOne(
               { id: trip.id, user_id: userId },
-              { $set: { bookings_plan: { basis, estimates, generated_at: new Date() } } },
+              { $set: { bookings_plan: { basis, estimates: complete, generated_at: new Date() } } },
             ).exec();
+            this.recent.delete(key);
+          } else {
+            // Partiel ou échec : servi tel quel 10 min, puis nouvel essai
+            this.recent.set(key, { at: Date.now(), value: estimates });
           }
           return estimates;
         })().finally(() => this.pending.delete(key)),
       );
     }
-    return this.pending.get(key)!;
+
+    const job = this.pending.get(key)!;
+    if (opts.wait <= 0) return { value: null, status: 'pending' };
+    const outcome = await Promise.race([
+      job.then((value) => ({ done: true as const, value })),
+      new Promise<{ done: false }>((resolve) => setTimeout(() => resolve({ done: false }), opts.wait)),
+    ]);
+    if (!outcome.done) return { value: null, status: 'pending' };
+    return { value: outcome.value, status: outcome.value ? 'ready' : 'failed' };
   }
 
   // ---------------------------------------------------------------------------

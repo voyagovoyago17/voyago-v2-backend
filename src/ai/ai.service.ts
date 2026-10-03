@@ -186,11 +186,13 @@ export interface BookingEstimatesDraft {
   booking_window?: string;
 }
 
-const BOOKING_ESTIMATES_SCHEMA: ResponseSchema = {
+/** Hébergements : quartiers, alternatives, moment pour réserver (listes bornées : pas de boucle sans fin) */
+const BOOKING_STAYS_SCHEMA: ResponseSchema = {
   type: SchemaType.OBJECT,
   properties: {
     stays: {
       type: SchemaType.ARRAY,
+      maxItems: 8,
       items: {
         type: SchemaType.OBJECT,
         properties: {
@@ -202,6 +204,7 @@ const BOOKING_ESTIMATES_SCHEMA: ResponseSchema = {
           tip: { type: SchemaType.STRING },
           options: {
             type: SchemaType.ARRAY,
+            maxItems: 3,
             items: {
               type: SchemaType.OBJECT,
               properties: {
@@ -218,8 +221,18 @@ const BOOKING_ESTIMATES_SCHEMA: ResponseSchema = {
         required: ['index', 'area', 'why', 'nightly_min', 'nightly_max'],
       },
     },
+    booking_window: { type: SchemaType.STRING },
+  },
+  required: ['stays'],
+} as ResponseSchema;
+
+/** Visites payantes, transports locaux, repas, pass et astuces (listes bornées) */
+const BOOKING_EXTRAS_SCHEMA: ResponseSchema = {
+  type: SchemaType.OBJECT,
+  properties: {
     activities: {
       type: SchemaType.ARRAY,
+      maxItems: 20,
       items: {
         type: SchemaType.OBJECT,
         properties: {
@@ -247,16 +260,60 @@ const BOOKING_ESTIMATES_SCHEMA: ResponseSchema = {
         name: { type: SchemaType.STRING },
         price_adult: { type: SchemaType.NUMBER },
         price_child: { type: SchemaType.NUMBER },
-        covers: { type: SchemaType.ARRAY, items: { type: SchemaType.STRING } },
+        covers: { type: SchemaType.ARRAY, maxItems: 15, items: { type: SchemaType.STRING } },
         tip: { type: SchemaType.STRING },
       },
       required: ['name', 'price_adult', 'covers'],
     },
-    money_tips: { type: SchemaType.ARRAY, items: { type: SchemaType.STRING } },
-    booking_window: { type: SchemaType.STRING },
+    money_tips: { type: SchemaType.ARRAY, maxItems: 3, items: { type: SchemaType.STRING } },
   },
-  required: ['stays', 'activities'],
-};
+  required: ['activities'],
+} as ResponseSchema;
+
+/** Réponse JSON coupée (limite de taille) : on garde tout ce qui est complet et on referme. */
+export function repairTruncatedJson(text: string): any | null {
+  const start = text.indexOf('{');
+  if (start < 0) return null;
+  const src = text.slice(start);
+  const stack: string[] = [];
+  const cuts: { end: number; closers: string }[] = [];
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < src.length; i++) {
+    const c = src[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (c === '\\') escaped = true;
+      else if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') inString = true;
+    else if (c === '{') stack.push('}');
+    else if (c === '[') stack.push(']');
+    else if (c === '}' || c === ']') {
+      stack.pop();
+      if (!stack.length) {
+        try {
+          return JSON.parse(src.slice(0, i + 1));
+        } catch {
+          return null;
+        }
+      }
+      cuts.push({ end: i + 1, closers: [...stack].reverse().join('') });
+    } else if (c === ',') {
+      cuts.push({ end: i, closers: [...stack].reverse().join('') });
+    }
+  }
+  // Du point de coupure le plus tardif au plus ancien : le premier JSON valide gagne
+  for (let k = cuts.length - 1; k >= Math.max(0, cuts.length - 40); k--) {
+    try {
+      return JSON.parse(src.slice(0, cuts[k].end) + cuts[k].closers);
+    } catch {
+      // point suivant
+    }
+  }
+  return null;
+}
 
 const PACKING_RESPONSE_SCHEMA: ResponseSchema = {
   type: SchemaType.OBJECT,
@@ -809,8 +866,8 @@ Réponds avec UNIQUEMENT un objet JSON : {"suggestions":[{"destination":"...","c
   }
 
   /**
-   * Réservations & Budget : quartier où dormir pour chaque étape, fourchette de prix par nuit,
-   * prix d'entrée des visites, pass de transport local. Estimations indicatives (à vérifier).
+   * Réservations & Budget : deux demandes courtes en parallèle (hébergements / visites & astuces),
+   * chacune bornée en taille et en temps. Résultat partiel possible ; null si les deux échouent.
    */
   async estimateBookings(input: {
     destination: string;
@@ -825,57 +882,87 @@ Réponds avec UNIQUEMENT un objet JSON : {"suggestions":[{"destination":"...","c
     transports: string[];
     /** Plafond par nuit pour tout le groupe, tiré du budget */
     nightly_cap?: number;
-  }): Promise<BookingEstimatesDraft | null> {
+  }): Promise<(BookingEstimatesDraft & { partial?: boolean }) | null> {
     const kids = input.children_ages.length ? `, enfants de ${input.children_ages.join(', ')} ans` : '';
     const month = input.start_date ? new Date(`${input.start_date.slice(0, 10)}T12:00:00Z`).toLocaleDateString('fr-FR', { month: 'long' }) : null;
-    const prompt = `Tu es Voyago, conseiller voyage local qui aide à réserver malin. Donne des estimations RÉALISTES et prudentes en ${input.currency}, telles qu'on les trouve en ligne${month ? ` en ${month} (tiens compte de la saison : haute, basse, événements)` : ''}.
-Voyage : ${input.destination}${input.country ? ` (${input.country})` : ''}, standing ${input.level}${input.start_date ? `, départ le ${input.start_date}` : ''}.
-Voyageurs : ${input.adults} adulte(s)${kids}. Déplacements : ${input.transports.join(', ') || 'marche'}.${input.nightly_cap ? `
-Budget hébergement du voyageur : ${input.nightly_cap} ${input.currency} la nuit pour tout le groupe.` : ''}
+    const people = input.adults + input.children_ages.length;
+    const context = `Voyage : ${input.destination}${input.country ? ` (${input.country})` : ''}, standing ${input.level}${input.start_date ? `, départ le ${input.start_date}` : ''}${month ? ` (saison de ${month} : tiens compte de la haute ou basse saison)` : ''}.
+Voyageurs : ${input.adults} adulte(s)${kids}. Déplacements : ${input.transports.join(', ') || 'marche'}. Devise : ${input.currency}.`;
+    const num = (v: any) => (typeof v === 'number' && isFinite(v) && v >= 0 ? Math.round(v) : 0);
+    const uniq = <T>(list: T[], key: (x: T) => string) => {
+      const seen = new Set<string>();
+      return list.filter((x) => {
+        const k = key(x).toLowerCase();
+        if (seen.has(k)) return false;
+        seen.add(k);
+        return true;
+      });
+    };
 
-Étapes d'hébergement (index, jours, lieux visités à proximité) :
-${input.stays.map((s) => `- ${s.index} · ${s.days} · ${s.near.slice(0, 4).join(', ')}`).join('\n')}
+    const staysPrompt = `Tu es Voyago, conseiller voyage local. Estime des prix RÉALISTES et prudents, tels qu'on les trouve en ligne.
+${context}${input.nightly_cap ? `\nBudget hébergement : ${input.nightly_cap} ${input.currency} la nuit pour tout le groupe.` : ''}
+
+Étapes (index · jours · lieux visités à proximité) :
+${input.stays.slice(0, 8).map((s) => `- ${s.index} · ${s.days} · ${s.near.slice(0, 4).join(', ')}`).join('\n')}
+
+Réponds en JSON compact :
+- "stays" : UNE entrée par étape ci-dessus, pas plus. "area" (quartier réel où dormir), "why" (15 mots max : proximité, ambiance, sécurité${input.children_ages.length ? ', familles' : ''}), "nightly_min"/"nightly_max" (une nuit pour les ${people} voyageurs, chambres adaptées, standing ${input.level}), "tip" (12 mots max), "options" : EXACTEMENT 3 autres façons de dormir (pension, appartement, auberge en chambre privée, hôtel 3★…), chacune "kind" (4 mots max), "area", "nightly_min", "nightly_max", "why" (12 mots max : ce qu'on gagne, ce qu'on sacrifie).${input.nightly_cap ? ` Au moins 2 options SOUS ${input.nightly_cap} ${input.currency}.` : ''}
+- "booking_window" : quand réserver pour ces dates (14 mots max).
+N'invente ni remise ni partenariat. Uniquement le JSON, sans répétition.`;
+
+    const extrasPrompt = `Tu es Voyago, conseiller voyage local. Donne des tarifs officiels RÉALISTES.
+${context}
 
 Lieux de l'itinéraire : ${input.places.slice(0, 20).join(' ; ')}
 
-Réponds :
-- "stays" : pour chaque étape, le quartier idéal où dormir ("area", nom réel), "why" (1 phrase, 15 mots max : proximité des lieux du jour, ambiance, sécurité${input.children_ages.length ? ', adapté aux enfants' : ''}), "nightly_min"/"nightly_max" = prix réaliste d'une nuit pour TOUT le groupe (${input.adults + input.children_ages.length} personnes, nombre de chambres adapté) au standing ${input.level}, "tip" (conseil de réservation concret, 12 mots max).
-  Ajoute "options" : 3 AUTRES façons de dormir pour cette étape, variées (ex : pension familiale, appartement, auberge avec chambre privée, hôtel 3★, maison d'hôtes), chacune avec "kind" (type, 4 mots max), "area" (quartier réel, voisin si moins cher et bien desservi), "nightly_min"/"nightly_max" (tout le groupe) et "why" (12 mots max : ce qu'on gagne, ce qu'on sacrifie).${input.nightly_cap ? ` Au moins 2 options doivent tenir SOUS ${input.nightly_cap} ${input.currency} la nuit.` : ''}
-- "activities" : uniquement les lieux PAYANTS de la liste (nom exact), "price_adult" et "price_child" (0 si gratuit pour les enfants) au tarif officiel, "advice" (ex : "Réserver en ligne : file d'attente évitée", "Gratuit le 1er dimanche", 10 mots max). Omets les lieux gratuits et les restaurants.
-- "local_transport" : le meilleur pass ou mode local (nom réel, ex : carte Navegante, Suica), "price_per_day" par personne, "tip".
-- "meals_per_person_per_day" : budget repas réaliste par adulte et par jour au standing ${input.level}.
-- "city_pass" : SEULEMENT s'il existe un vrai pass touristique couvrant plusieurs lieux payants de la liste (nom réel, ex : Paris Museum Pass, Roma Pass) : "price_adult", "price_child", "covers" (noms EXACTS des lieux de la liste inclus), "tip". Sinon omets le champ.
-- "money_tips" : 3 astuces concrètes et locales pour dépenser moins pendant CE voyage (jours gratuits, menus du midi, transports, quartiers), 14 mots max chacune.
-- "booking_window" : quand réserver l'hébergement pour ces dates (ex : "Réserve 6 à 8 semaines avant : forte demande en juillet"), 14 mots max.
-N'invente jamais de remise, de prix promotionnel ni de partenariat. Réponds avec UNIQUEMENT l'objet JSON.`;
+Réponds en JSON compact :
+- "activities" : uniquement les lieux PAYANTS de la liste (nom EXACT, chacun une seule fois, 20 max), "price_adult", "price_child" (0 si gratuit), "advice" (10 mots max, ex : "Gratuit le 1er dimanche"). Omets les lieux gratuits et restaurants.
+- "local_transport" : meilleur pass ou mode local (nom réel), "price_per_day" par personne, "tip".
+- "meals_per_person_per_day" : budget repas par adulte et par jour, standing ${input.level}.
+- "city_pass" : SEULEMENT si un vrai pass couvre au moins 2 lieux payants de la liste : "name", "price_adult", "price_child", "covers" (noms exacts, 15 max), "tip". Sinon omets-le.
+- "money_tips" : EXACTEMENT 3 astuces locales concrètes pour dépenser moins (14 mots max chacune).
+N'invente ni remise ni partenariat. Uniquement le JSON, sans répétition.`;
 
-    const parse = (text: string): BookingEstimatesDraft | null => {
-      const raw = JSON.parse(text.replace(/```json/g, '').replace(/```/g, '').trim());
+    const parseStays = (raw: any) => {
       if (!raw || !Array.isArray(raw.stays)) return null;
-      const num = (v: any) => (typeof v === 'number' && isFinite(v) && v >= 0 ? Math.round(v) : 0);
+      const stays = uniq(
+        raw.stays.filter((s: any) => typeof s?.area === 'string'),
+        (s: any) => String(s.index),
+      )
+        .slice(0, 8)
+        .map((s: any) => ({
+          index: Number(s.index) || 1,
+          area: s.area.trim().slice(0, 60),
+          why: String(s.why || '').trim().slice(0, 140),
+          nightly_min: num(s.nightly_min),
+          nightly_max: Math.max(num(s.nightly_max), num(s.nightly_min)),
+          tip: s.tip ? String(s.tip).trim().slice(0, 100) : undefined,
+          options: uniq(
+            (Array.isArray(s.options) ? s.options : []).filter(
+              (o: any) => typeof o?.kind === 'string' && typeof o?.area === 'string' && num(o.nightly_min) > 0,
+            ),
+            (o: any) => `${o.kind}|${o.area}`,
+          )
+            .slice(0, 3)
+            .map((o: any) => ({
+              kind: o.kind.trim().slice(0, 40),
+              area: o.area.trim().slice(0, 60),
+              nightly_min: num(o.nightly_min),
+              nightly_max: Math.max(num(o.nightly_max), num(o.nightly_min)),
+              why: String(o.why || '').trim().slice(0, 110),
+            })),
+        }));
+      if (!stays.length) return null;
+      return { stays, booking_window: raw.booking_window ? String(raw.booking_window).trim().slice(0, 120) : undefined };
+    };
+
+    const parseExtras = (raw: any) => {
+      if (!raw || typeof raw !== 'object') return null;
       return {
-        stays: raw.stays
-          .filter((s: any) => typeof s?.area === 'string')
-          .map((s: any) => ({
-            index: Number(s.index) || 1,
-            area: s.area.trim().slice(0, 60),
-            why: String(s.why || '').trim().slice(0, 140),
-            nightly_min: num(s.nightly_min),
-            nightly_max: Math.max(num(s.nightly_max), num(s.nightly_min)),
-            tip: s.tip ? String(s.tip).trim().slice(0, 100) : undefined,
-            options: (Array.isArray(s.options) ? s.options : [])
-              .filter((o: any) => typeof o?.kind === 'string' && typeof o?.area === 'string' && num(o.nightly_min) > 0)
-              .slice(0, 3)
-              .map((o: any) => ({
-                kind: o.kind.trim().slice(0, 40),
-                area: o.area.trim().slice(0, 60),
-                nightly_min: num(o.nightly_min),
-                nightly_max: Math.max(num(o.nightly_max), num(o.nightly_min)),
-                why: String(o.why || '').trim().slice(0, 110),
-              })),
-          })),
-        activities: (Array.isArray(raw.activities) ? raw.activities : [])
-          .filter((a: any) => typeof a?.name === 'string' && num(a.price_adult) > 0)
+        activities: uniq(
+          (Array.isArray(raw.activities) ? raw.activities : []).filter((a: any) => typeof a?.name === 'string' && num(a.price_adult) > 0),
+          (a: any) => a.name.trim(),
+        )
           .slice(0, 20)
           .map((a: any) => ({
             name: a.name.trim().slice(0, 80),
@@ -898,43 +985,89 @@ N'invente jamais de remise, de prix promotionnel ni de partenariat. Réponds ave
                 name: raw.city_pass.name.trim().slice(0, 60),
                 price_adult: num(raw.city_pass.price_adult),
                 price_child: num(raw.city_pass.price_child),
-                covers: raw.city_pass.covers.filter((c: any) => typeof c === 'string').map((c: string) => c.trim().slice(0, 80)).slice(0, 15),
+                covers: [...new Set<string>(raw.city_pass.covers.filter((c: any) => typeof c === 'string').map((c: string) => c.trim().slice(0, 80)))].slice(0, 15),
                 tip: raw.city_pass.tip ? String(raw.city_pass.tip).trim().slice(0, 100) : undefined,
               }
             : undefined,
-        money_tips: (Array.isArray(raw.money_tips) ? raw.money_tips : [])
-          .filter((t: any) => typeof t === 'string' && t.trim())
-          .map((t: string) => t.trim().slice(0, 120))
-          .slice(0, 3),
-        booking_window: raw.booking_window ? String(raw.booking_window).trim().slice(0, 120) : undefined,
+        money_tips: [...new Set<string>((Array.isArray(raw.money_tips) ? raw.money_tips : []).filter((t: any) => typeof t === 'string' && t.trim()).map((t: string) => t.trim().slice(0, 120)))].slice(0, 3),
       };
     };
 
-    if (this.genAI) {
-      for (const modelName of ['gemini-3.5-flash-lite', 'gemini-flash-lite-latest', 'gemini-flash-latest']) {
-        try {
-          const model = this.genAI.getGenerativeModel({
-            model: modelName,
-            generationConfig: { responseMimeType: 'application/json', responseSchema: BOOKING_ESTIMATES_SCHEMA, temperature: 0.3 },
-          });
-          const result = parse((await model.generateContent(prompt)).response.text());
-          if (result) return result;
-        } catch (err: any) {
-          this.logger.warn(`Booking estimates with ${modelName} failed: ${err.message}`);
-        }
-      }
-    }
-    if (this.anthropic) {
+    const [stays, extras] = await Promise.all([
+      this.runBoundedJson('Booking stays', staysPrompt, BOOKING_STAYS_SCHEMA, parseStays, 2048),
+      this.runBoundedJson('Booking extras', extrasPrompt, BOOKING_EXTRAS_SCHEMA, parseExtras, 2048),
+    ]);
+    if (!stays && !extras) return null;
+    return {
+      stays: stays?.stays ?? [],
+      booking_window: stays?.booking_window,
+      activities: extras?.activities ?? [],
+      local_transport: extras?.local_transport,
+      meals_per_person_per_day: extras?.meals_per_person_per_day,
+      city_pass: extras?.city_pass,
+      money_tips: extras?.money_tips ?? [],
+      partial: !stays || !extras,
+    };
+  }
+
+  /**
+   * Appel IA borné : réponse plafonnée en tokens, 20 s max par appel, 30 s au total.
+   * Ordre : Gemini rapide → Claude Haiku → Gemini de secours. JSON coupé : réparé au lieu d'être jeté.
+   */
+  private async runBoundedJson<T>(
+    label: string,
+    prompt: string,
+    schema: ResponseSchema,
+    parse: (raw: any) => T | null,
+    maxTokens: number,
+  ): Promise<T | null> {
+    const deadline = Date.now() + 30_000;
+    const remaining = () => Math.min(20_000, deadline - Date.now());
+    const decode = (text: string): T | null => {
+      const clean = text.replace(/```json/g, '').replace(/```/g, '').trim();
+      let raw: any = null;
       try {
-        const message = await this.anthropic.messages.create({
-          model: 'claude-haiku-4-5',
-          max_tokens: 4000,
-          messages: [{ role: 'user', content: prompt }],
-        });
-        const textBlock = message.content.find((b): b is Anthropic.TextBlock => b.type === 'text');
-        if (textBlock) return parse(textBlock.text);
+        raw = JSON.parse(clean);
+      } catch {
+        raw = repairTruncatedJson(clean);
+        if (raw) this.logger.warn(`${label} : réponse coupée, partie complète conservée`);
+      }
+      return raw ? parse(raw) : null;
+    };
+
+    const gemini = async (modelName: string) => {
+      if (!this.genAI || remaining() < 4000) return null;
+      const model = this.genAI.getGenerativeModel(
+        {
+          model: modelName,
+          generationConfig: { responseMimeType: 'application/json', responseSchema: schema, temperature: 0.3, maxOutputTokens: maxTokens },
+        },
+        { timeout: remaining() },
+      );
+      return decode((await model.generateContent(prompt)).response.text());
+    };
+    const claude = async () => {
+      if (!this.anthropic || remaining() < 4000) return null;
+      const message = await this.anthropic.messages.create(
+        { model: 'claude-haiku-4-5', max_tokens: maxTokens, messages: [{ role: 'user', content: prompt }] },
+        { timeout: remaining(), maxRetries: 0 },
+      );
+      const textBlock = message.content.find((b): b is Anthropic.TextBlock => b.type === 'text');
+      return textBlock ? decode(textBlock.text) : null;
+    };
+
+    const attempts: [string, () => Promise<T | null>][] = [
+      ['gemini-3.5-flash-lite', () => gemini('gemini-3.5-flash-lite')],
+      ['claude-haiku-4-5', claude],
+      ['gemini-flash-latest', () => gemini('gemini-flash-latest')],
+    ];
+    for (const [name, attempt] of attempts) {
+      if (remaining() < 4000) break;
+      try {
+        const result = await attempt();
+        if (result) return result;
       } catch (err: any) {
-        this.logger.warn(`Booking estimates with Claude failed: ${err.message}`);
+        this.logger.warn(`${label} with ${name} failed: ${String(err.message).slice(0, 200)}`);
       }
     }
     return null;
