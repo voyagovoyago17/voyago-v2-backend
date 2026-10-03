@@ -443,7 +443,7 @@ export class TribeTripsService {
       },
       {
         startDate: startDate || plan.start_date,
-        origin: { tribe_plan: { plan_id: plan.id, circle_id: plan.circle_id } },
+        origin: { tribe_plan: { plan_id: plan.id, circle_id: plan.circle_id, founder_id: plan.created_by } },
       },
     );
     await this.planModel.updateOne({ id: planId }, { $addToSet: { joined_by: user.user_id } }).exec();

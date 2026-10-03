@@ -73,6 +73,10 @@ export class User {
   @Prop({ default: null })
   pro_expires_at: Date;
 
+  /** Essai offert « refaire une journée » utilisé (gratuit, un seul voyage) */
+  @Prop({ default: false })
+  free_redo_used: boolean;
+
   @Prop({ default: Date.now })
   created_at: Date;
 }

@@ -157,6 +157,29 @@ export class Trip {
   /** Journal partagé à la communauté (XP attribuée une seule fois) */
   @Prop({ type: Date, default: null })
   journal_shared_at?: Date | null;
+
+  /** Voyage issu d'un vote de tribu : l'itinéraire voté n'est modifiable que par son fondateur */
+  @Prop({ type: Object, default: null })
+  tribe_plan?: { plan_id: string; circle_id: string; founder_id?: string } | null;
+
+  /** Voyage annulé : il redevient une idée sans dates (« Mes idées ») */
+  @Prop({ type: Date, default: null })
+  cancelled_at?: Date | null;
+
+  @Prop({ type: Object, default: null })
+  cancelled_dates?: { start: string; end: string | null } | null;
+
+  /** Compteurs de modifications : dates décalées, lieux remplacés, journées refaites, crédits en plus, plans B */
+  // Pas de valeur par défaut : un `$inc` sur `edits.x` échouerait si `edits` valait null
+  @Prop({ type: Object })
+  edits?: {
+    date_changes?: number;
+    swaps?: number;
+    redos?: number;
+    extra_credits?: number;
+    plan_b_days?: number[];
+    plan_b_notified?: number[];
+  };
 }
 
 export const TripSchema = SchemaFactory.createForClass(Trip);

@@ -14,7 +14,13 @@ import { PaymentTransaction, PaymentTransactionDocument } from './schemas/paymen
 import { User, UserDocument } from '../auth/schemas/user.schema';
 import { ProfileSchema } from '../gamification/schemas/profile.schema';
 import { TenancyService } from '../tenancy/tenancy.service';
+import { TripSchema } from '../trips/schemas/trip.schema';
+import { FREE_TRIPS_PER_MONTH } from '../trips/trips.service';
 
+/**
+ * Formules et avantages affichés sur les cartes de l'écran Pro.
+ * Les quotas de modification (refaire une journée / tout refaire) sont par voyage.
+ */
 const TIERS = [
   {
     id: 'monthly',
@@ -22,12 +28,17 @@ const TIERS = [
     price: 4.99,
     currency: 'eur',
     duration: 'month',
+    tagline: 'Pour un voyage qui arrive bientôt',
     benefits: [
       'Voyages illimités',
+      '2 journées refaites par voyage (IA, lieux vérifiés)',
+      'Lieux remplacés à volonté',
+      'Dates décalées sans limite avant le départ',
+      'Plan B pluie en un geste',
       'Météo étendue 16 jours',
       'Badge Pro 💎',
-      "Accès anticipé aux nouvelles fonctionnalités",
     ],
+    edit_quota: { redos: 2, swaps: null, date_changes: null, plan_b: true },
     stripe_price_id: 'price_monthly',
   },
   {
@@ -36,13 +47,19 @@ const TIERS = [
     price: 39.99,
     currency: 'eur',
     duration: 'year',
+    tagline: 'Le meilleur rapport : −33 % vs mensuel',
+    savings_percent: 33,
     benefits: [
-      'Voyages illimités',
+      'Voyages illimités toute l’année',
+      '4 journées refaites par voyage (IA, lieux vérifiés)',
+      'Lieux remplacés à volonté',
+      'Dates décalées sans limite avant le départ',
+      'Plan B pluie en un geste',
       'Météo étendue 16 jours',
-      'Badge Pro 💎',
-      'Accès anticipé',
-      '2 mois offerts',
+      'Badge Pro 💎 et accès anticipé',
+      '4 mois offerts par rapport au mensuel',
     ],
+    edit_quota: { redos: 4, swaps: null, date_changes: null, plan_b: true },
     stripe_price_id: 'price_annual',
     best_offer: true,
   },
@@ -52,16 +69,53 @@ const TIERS = [
     price: 79.99,
     currency: 'eur',
     duration: 'lifetime',
+    tagline: 'Un seul paiement, pour toujours',
     benefits: [
-      'Voyages illimités',
+      'Voyages illimités, pour toujours',
+      '6 journées refaites par voyage (IA, lieux vérifiés)',
+      'Lieux remplacés à volonté',
+      'Dates décalées sans limite avant le départ',
+      'Plan B pluie en un geste',
       'Météo étendue 16 jours',
-      'Badge Pro 💎',
-      'Accès anticipé',
+      'Badge Pro 💎, accès anticipé',
       'Toutes les futures fonctionnalités',
     ],
+    edit_quota: { redos: 6, swaps: null, date_changes: null, plan_b: true },
     stripe_price_id: 'price_lifetime',
   },
 ];
+
+/** Carte « Gratuit » : ce qui est inclus et ce qui manque, pour comparer en un coup d'œil */
+const FREE_PLAN = {
+  id: 'free',
+  name: 'Gratuit',
+  price: 0,
+  currency: 'eur',
+  included: [
+    `${FREE_TRIPS_PER_MONTH} voyages créés par mois`,
+    'Itinéraire IA avec lieux réels vérifiés',
+    'Pépites à collectionner, XP et badges',
+    'Journal, réservations et budget',
+    'Annuler un voyage à tout moment (il rejoint tes idées)',
+    'Décaler les dates 1 fois par voyage',
+    'Remplacer 2 lieux par voyage',
+    '1 journée refaite offerte (une seule fois)',
+  ],
+  missing: [
+    'Voyages illimités',
+    'Journées refaites à chaque voyage (2, 4 ou 6 selon la formule)',
+    'Lieux remplacés à volonté',
+    'Dates décalées sans limite',
+    'Plan B pluie en un geste',
+    'Météo étendue 16 jours',
+    'Planifier un voyage de tribu',
+    'Badge Pro 💎',
+  ],
+  edit_quota: { redos: 0, free_trial: 1, swaps: 2, date_changes: 1, plan_b: false },
+};
+
+/** Pack de modifications pour un voyage (paiement unique) */
+const EDIT_PACK = { id: 'edit_pack', name: 'Pack 3 modifications', credits: 3, price: 0.99, currency: 'eur' };
 
 import { GLOBAL_DB_CONNECTION } from '../common/constants';
 
@@ -84,6 +138,76 @@ export class ProService {
 
   getTiers(): object[] {
     return TIERS;
+  }
+
+  getFreePlan(): object {
+    return { ...FREE_PLAN, edit_pack: EDIT_PACK };
+  }
+
+  /** Pack de 3 modifications pour un voyage : paiement unique de 0,99 € */
+  async createEditPackCheckout(user: UserDocument, tripId: string): Promise<{ checkout_url: string; session_id: string }> {
+    if (!this.stripe) {
+      throw new InternalServerErrorException('Stripe not configured');
+    }
+    const TripModel = await this.tenancyService.getTenantModel<any>(user.user_id, 'Trip', TripSchema);
+    const trip: any = await TripModel.findOne({ id: tripId, user_id: user.user_id }).select('id destination completed_at').lean().exec();
+    if (!trip) throw new NotFoundException(`Trip ${tripId} not found`);
+    if (trip.completed_at) throw new BadRequestException('Ce voyage est terminé.');
+
+    const appBaseUrl = this.configService.get<string>('APP_BASE_URL', 'http://localhost:8001');
+    const metadata = { user_id: user.user_id, tier: EDIT_PACK.id, trip_id: tripId, email: user.email || '' };
+    const session = await this.stripe.checkout.sessions.create({
+      mode: 'payment',
+      success_url: `${appBaseUrl}/pricing?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${appBaseUrl}/pricing?cancelled=true`,
+      metadata,
+      ...(user.email ? { customer_email: user.email } : {}),
+      line_items: [
+        {
+          price_data: {
+            currency: EDIT_PACK.currency,
+            product_data: {
+              name: `Voyagooo – ${EDIT_PACK.name}`,
+              description: `${EDIT_PACK.credits} modifications en plus pour ton voyage ${trip.destination || ''}`.trim(),
+            },
+            unit_amount: Math.round(EDIT_PACK.price * 100),
+          },
+          quantity: 1,
+        },
+      ],
+    });
+
+    await this.transactionModel.create({
+      session_id: session.id,
+      user_id: user.user_id,
+      tier: EDIT_PACK.id,
+      amount: Math.round(EDIT_PACK.price * 100),
+      currency: EDIT_PACK.currency,
+      status: 'initiated',
+      payment_status: 'unpaid',
+      applied: false,
+      metadata,
+      created_at: new Date(),
+      updated_at: new Date(),
+    });
+    return { checkout_url: session.url, session_id: session.id };
+  }
+
+  /** Pack payé : crédits ajoutés au voyage une seule fois (webhook et vérification peuvent se croiser) */
+  private async applyEditPack(user_id: string, session_id: string): Promise<void> {
+    const tx: any = await this.transactionModel
+      .findOneAndUpdate(
+        { session_id, applied: false },
+        { $set: { applied: true, status: 'complete', payment_status: 'paid', updated_at: new Date() } },
+      )
+      .lean()
+      .exec();
+    if (!tx) return;
+    const tripId = tx.metadata?.trip_id;
+    if (!tripId) return;
+    const TripModel = await this.tenancyService.getTenantModel<any>(user_id, 'Trip', TripSchema);
+    await TripModel.updateOne({ id: tripId, user_id }, { $inc: { 'edits.extra_credits': EDIT_PACK.credits } }).exec();
+    this.logger.log(`Pack de modifications appliqué : voyage ${tripId} (+${EDIT_PACK.credits})`);
   }
 
   async createCheckout(user: UserDocument, tier: string): Promise<{ checkout_url: string; session_id: string }> {
@@ -231,6 +355,7 @@ export class ProService {
   }
 
   async applyProStatus(user_id: string, tier: string, session_id: string): Promise<void> {
+    if (tier === EDIT_PACK.id) return this.applyEditPack(user_id, session_id);
     let pro_expires_at: Date | null = null;
 
     if (tier === 'monthly') {

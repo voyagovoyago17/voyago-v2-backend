@@ -26,6 +26,8 @@ import { TripBookingsService } from './trip-bookings.service';
 import { AddTripBookingDto } from './dto/bookings.dto';
 import { PriceAlertService } from './price-alert.service';
 import { TravelpayoutsService } from './travelpayouts.service';
+import { TripEditsService } from './trip-edits.service';
+import { RegenerateTripDto, SwapPoiDto } from './dto/trip-edits.dto';
 
 @ApiTags('✈️ Voyages & Itinéraires IA')
 @Controller()
@@ -37,6 +39,7 @@ export class TripsController {
     private readonly tripBookingsService: TripBookingsService,
     private readonly priceAlertService: PriceAlertService,
     private readonly travelpayouts: TravelpayoutsService,
+    private readonly tripEdits: TripEditsService,
   ) {}
 
   /** Inspiration budget : destinations les moins chères en avion depuis la ville du voyageur */
@@ -172,6 +175,87 @@ export class TripsController {
   @UseGuards(SessionAuthGuard)
   async disablePriceAlert(@CurrentUser() user: any, @Param('trip_id') trip_id: string) {
     return this.priceAlertService.disable(user.user_id, trip_id);
+  }
+
+  /** Jours déjà pris par des voyages programmés (grisés dans le calendrier) */
+  @ApiOperation({ summary: 'Dates déjà prises par mes voyages programmés' })
+  @ApiBearerAuth()
+  @Get('me/busy-dates')
+  @UseGuards(SessionAuthGuard)
+  async busyDates(@CurrentUser() user: any, @Query('exclude') exclude?: string) {
+    return this.tripsService.busyDates(user.user_id, exclude || undefined);
+  }
+
+  /** Annuler un voyage pas encore commencé : il redevient une idée sans dates (gratuit) */
+  @ApiOperation({ summary: 'Annuler un voyage programmé (il rejoint « Mes idées »)' })
+  @ApiBearerAuth()
+  @Post('trip/:trip_id/cancel')
+  @UseGuards(SessionAuthGuard)
+  async cancelTrip(@CurrentUser() user: any, @Param('trip_id') trip_id: string) {
+    return this.tripsService.cancelTrip(user.user_id, trip_id);
+  }
+
+  /** Ce que le voyageur peut encore modifier sur ce voyage, selon sa formule */
+  @ApiOperation({ summary: 'Droits et compteurs de modification du voyage' })
+  @ApiBearerAuth()
+  @Get('trip/:trip_id/edit-options')
+  @UseGuards(SessionAuthGuard)
+  async editOptions(@CurrentUser() user: any, @Param('trip_id') trip_id: string) {
+    return this.tripEdits.options(user.user_id, trip_id);
+  }
+
+  /** Lieux réels vérifiés proches, pour remplacer un lieu du programme */
+  @ApiOperation({ summary: 'Lieux de remplacement (réels, vérifiés)' })
+  @ApiBearerAuth()
+  @Get('trip/:trip_id/pois/alternatives')
+  @UseGuards(SessionAuthGuard)
+  async poiAlternatives(
+    @CurrentUser() user: any,
+    @Param('trip_id') trip_id: string,
+    @Query('day') day: string,
+    @Query('order') order: string,
+  ) {
+    return this.tripEdits.alternatives(user.user_id, trip_id, Number(day), Number(order));
+  }
+
+  @ApiOperation({ summary: 'Remplacer un lieu par un lieu vérifié' })
+  @ApiBearerAuth()
+  @Post('trip/:trip_id/pois/swap')
+  @UseGuards(SessionAuthGuard)
+  async swapPoi(@CurrentUser() user: any, @Param('trip_id') trip_id: string, @Body() dto: SwapPoiDto) {
+    return this.tripEdits.swap(user.user_id, trip_id, dto);
+  }
+
+  @ApiOperation({ summary: 'Refaire une journée (compte dans le quota de modifications)' })
+  @ApiBearerAuth()
+  @Post('trip/:trip_id/days/:day/redo')
+  @UseGuards(SessionAuthGuard)
+  async redoDay(@CurrentUser() user: any, @Param('trip_id') trip_id: string, @Param('day') day: string) {
+    return this.tripEdits.redoDay(user.user_id, trip_id, Number(day));
+  }
+
+  @ApiOperation({ summary: 'Plan B pluie : programme à l’abri pour une journée (Pro)' })
+  @ApiBearerAuth()
+  @Post('trip/:trip_id/days/:day/plan-b')
+  @UseGuards(SessionAuthGuard)
+  async planB(@CurrentUser() user: any, @Param('trip_id') trip_id: string, @Param('day') day: string) {
+    return this.tripEdits.redoDay(user.user_id, trip_id, Number(day), { planB: true });
+  }
+
+  @ApiOperation({ summary: 'Tout refaire avant le départ (compte dans le quota de modifications)' })
+  @ApiBearerAuth()
+  @Post('trip/:trip_id/regenerate')
+  @UseGuards(SessionAuthGuard)
+  async regenerate(@CurrentUser() user: any, @Param('trip_id') trip_id: string, @Body() dto: RegenerateTripDto) {
+    return this.tripEdits.regenerate(user.user_id, trip_id, dto);
+  }
+
+  @ApiOperation({ summary: 'Échanger des XP contre une modification en plus' })
+  @ApiBearerAuth()
+  @Post('trip/:trip_id/edit-credits/xp')
+  @UseGuards(SessionAuthGuard)
+  async creditWithXp(@CurrentUser() user: any, @Param('trip_id') trip_id: string) {
+    return this.tripEdits.creditWithXp(user.user_id, trip_id);
   }
 
   /** Ajouter ou changer les dates d'un voyage (la fin découle de la durée) */

@@ -14,6 +14,10 @@ export class Profile {
   @Prop({ default: 0 })
   xp: number;
 
+  /** XP échangés contre des crédits de modification (le niveau reste calculé sur `xp`) */
+  @Prop({ default: 0 })
+  xp_spent: number;
+
   @Prop({ default: 1 })
   level: number;
 

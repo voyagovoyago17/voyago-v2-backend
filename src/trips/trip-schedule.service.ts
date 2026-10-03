@@ -60,6 +60,11 @@ export class TripScheduleService {
     }
   }
 
+  /** Voyage annulé (redevenu une idée sans dates) : plus de rappel ni de clôture automatique. */
+  async unregister(tripId: string): Promise<void> {
+    await this.scheduleModel.deleteOne({ trip_id: tripId }).exec().catch(() => undefined);
+  }
+
   /** Dates modifiées : le voyage sera de nouveau clôturé automatiquement à sa nouvelle fin. */
   async reset(userId: string, trip: any): Promise<void> {
     await this.scheduleModel

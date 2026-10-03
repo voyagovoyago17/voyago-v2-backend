@@ -506,12 +506,31 @@ export class AiService {
    * Lieux de l'itinéraire et, pour un voyage classique, pépites à collectionner
    * (même appel IA : aucun coût supplémentaire). Les pépites peuvent être vides.
    */
-  async generatePoisAndGems(dto: GenerateTripDto): Promise<{ pois: POI[]; gems: TripGem[] }> {
+  /**
+   * Refaire une seule journée (modification d'un voyage, plan B pluie) : mêmes règles et même
+   * vérification des lieux que pour un voyage complet, sans reprendre les lieux des autres jours.
+   */
+  async generateDayPois(dto: GenerateTripDto, opts: { day: number; avoid: string[]; indoor?: boolean }): Promise<POI[]> {
+    const dayDto = { ...dto, duration_days: 1, end_date: undefined, single_day: true } as GenerateTripDto;
+    const constraints = `
+
+## CONTRAINTES DE CETTE JOURNÉE
+- Une seule journée (jour 1 dans ta réponse).${opts.avoid.length ? `
+- Ne reprends AUCUN de ces lieux, déjà au programme des autres jours : ${opts.avoid.slice(0, 60).join(' ; ')}.` : ''}${
+      opts.indoor
+        ? '\n- PLAN B PLUIE : uniquement des lieux couverts (musées, galeries, marchés couverts, cafés, ateliers, monuments à visiter à l’intérieur). Aucun parc, plage, jardin ni point de vue en plein air.'
+        : ''
+    }`;
+    const res = await this.generatePoisAndGems(dayDto, constraints);
+    return res.pois.map((p) => ({ ...p, day: opts.day }));
+  }
+
+  async generatePoisAndGems(dto: GenerateTripDto, extraContext = ''): Promise<{ pois: POI[]; gems: TripGem[] }> {
     // 0. Ancrage dans le réel : lieux réels de la destination donnés à l'IA, puis vérifiés
     const cityCoords = await this.resolveDestinationCoordinates(dto.destination);
     const scope = this.grounding ? await this.grounding.scope(dto.destination, cityCoords) : null;
     const places = scope ? await this.grounding!.candidates(scope).catch(() => [] as GroundedPlace[]) : [];
-    const groundingText = this.grounding?.promptContext(places) ?? '';
+    const groundingText = (this.grounding?.promptContext(places) ?? '') + extraContext;
 
     let result: { pois: POI[]; gems: TripGem[] } | null = null;
     // 1. Claude, uniquement si AI_PROVIDER=claude (client non créé sinon)
@@ -1185,7 +1204,7 @@ ${input.places.length ? `- "activities" : UNE entrée par lieu de la liste (nom 
 
   /** Les pépites ne sont demandées que pour un voyage classique (pas pour un vote de tribu). */
   private wantsGems(dto: GenerateTripDto): boolean {
-    return dto.purpose !== 'tribe_vote';
+    return dto.purpose !== 'tribe_vote' && !(dto as any).single_day;
   }
 
   /**

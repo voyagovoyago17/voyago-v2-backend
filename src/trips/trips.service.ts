@@ -8,6 +8,7 @@ import {
 } from '@nestjs/common';
 import { TripScheduleService } from './trip-schedule.service';
 import { TripBookingsService } from './trip-bookings.service';
+import { PriceAlertService } from './price-alert.service';
 import { nameSimilarity } from '../ai/place-grounding.service';
 import { UpdateTripDatesDto } from './dto/update-trip-dates.dto';
 import { InjectModel } from '@nestjs/mongoose';
@@ -56,6 +57,7 @@ export class TripsService {
     private readonly notificationsService: NotificationsService,
     private readonly tripSchedule: TripScheduleService,
     private readonly tripBookings: TripBookingsService,
+    private readonly priceAlerts: PriceAlertService,
   ) {}
 
   /**
@@ -70,6 +72,77 @@ export class TripsService {
     });
     await Promise.race([task.catch(() => {}), timeout]);
     clearTimeout(timer);
+  }
+
+  /** Voyages programmés (datés, ni terminés ni passés) : leurs jours sont bloqués dans le calendrier. */
+  async busyDates(userId: string, excludeTripId?: string) {
+    const TripModel = await this.tenancyService.getTenantModel<TripDocument>(userId, 'Trip', TripSchema);
+    const trips: any[] = await TripModel.find({ user_id: userId, start_date: { $nin: [null, ''] }, completed_at: null })
+      .select('id destination city start_date end_date duration_days')
+      .lean()
+      .exec();
+    const today = new Date().toISOString().slice(0, 10);
+    return trips
+      .map((t) => ({
+        trip_id: t.id,
+        destination: t.city || String(t.destination).split(',')[0],
+        start: String(t.start_date).slice(0, 10),
+        end: (t.end_date ? String(t.end_date) : this.endDateFrom(t.start_date, t.duration_days) || String(t.start_date)).slice(0, 10),
+      }))
+      .filter((t) => t.trip_id !== excludeTripId && t.end >= today)
+      .sort((a, b) => a.start.localeCompare(b.start));
+  }
+
+  /**
+   * Un voyage ne peut pas chevaucher un autre voyage programmé. Le jour de transition est permis
+   * (un voyage peut commencer le jour où le précédent se termine : Rome → Naples).
+   */
+  async assertNoOverlap(userId: string, start: string | undefined, durationDays: number, excludeTripId?: string) {
+    if (!start || !/^\d{4}-\d{2}-\d{2}/.test(start)) return;
+    const s0 = start.slice(0, 10);
+    const e0 = this.endDateFrom(s0, durationDays)!;
+    const fr = (d: string) => new Date(`${d}T12:00:00Z`).toLocaleDateString('fr-FR', { day: 'numeric', month: 'short' });
+    for (const t of await this.busyDates(userId, excludeTripId)) {
+      const overlaps = (s0 < t.end && t.start < e0) || s0 === t.start;
+      if (overlaps) {
+        throw new HttpException(
+          {
+            statusCode: 409,
+            code: 'TRIP_DATES_OVERLAP',
+            message: `Ces dates chevauchent ton voyage à ${t.destination} (${fr(t.start)} → ${fr(t.end)}). Choisis d'autres dates ou décale ce voyage.`,
+            trip_id: t.trip_id,
+            error: 'Conflict',
+          },
+          HttpStatus.CONFLICT,
+        );
+      }
+    }
+  }
+
+  /**
+   * Annuler un voyage programmé (gratuit pour tous) : il devient une idée sans dates, gardée dans
+   * « Mes idées » avec son itinéraire et son budget, prête à être reprogrammée.
+   */
+  async cancelTrip(userId: string, tripId: string) {
+    const TripModel = await this.tenancyService.getTenantModel<TripDocument>(userId, 'Trip', TripSchema);
+    const trip: any = await TripModel.findOne({ id: tripId, user_id: userId }).lean().exec();
+    if (!trip) throw new NotFoundException(`Trip ${tripId} not found`);
+    if (trip.completed_at) throw new BadRequestException('Ce voyage est déjà terminé : il est rangé dans ton journal.');
+    const today = new Date().toISOString().slice(0, 10);
+    if (trip.start_date && String(trip.start_date).slice(0, 10) <= today) {
+      throw new BadRequestException('Ce voyage a déjà commencé : tu peux encore remplacer un lieu ou refaire une journée.');
+    }
+    const set = {
+      start_date: null,
+      end_date: null,
+      cancelled_at: new Date(),
+      cancelled_dates: trip.start_date ? { start: trip.start_date, end: trip.end_date || null } : null,
+    };
+    await TripModel.updateOne({ id: tripId, user_id: userId }, { $set: set }).exec();
+    this.sharedTripModel.updateOne({ id: tripId }, { $set: { start_date: null, end_date: null } }).exec().catch(() => undefined);
+    await this.tripSchedule.unregister(tripId);
+    await this.priceAlerts.disable(userId, tripId).catch(() => undefined);
+    return TripModel.findOne({ id: tripId }).lean().exec();
   }
 
   /** Dernier jour (AAAA-MM-JJ) d'un voyage de `days` jours commençant le `start`. */
@@ -94,10 +167,33 @@ export class TripsService {
     if (isNaN(new Date(`${start}T00:00:00Z`).getTime())) {
       throw new BadRequestException('Date de début invalide');
     }
-    const end = this.endDateFrom(start, trip.duration_days)!;
-    const set: Record<string, any> = { start_date: start, end_date: end };
-
     const today = new Date().toISOString().slice(0, 10);
+    const hadDates = !!trip.start_date;
+    if (hadDates && !trip.completed_at) {
+      // Voyage commencé : on ne décale plus ses dates (on peut encore remplacer un lieu ou refaire une journée)
+      if (String(trip.start_date).slice(0, 10) <= today) {
+        throw new BadRequestException('Ce voyage a déjà commencé : ses dates ne peuvent plus être décalées.');
+      }
+      if (start < today) throw new BadRequestException('Choisis une date à partir d’aujourd’hui.');
+      // Formule gratuite : un seul décalage par voyage (ajouter des dates la première fois reste libre)
+      const user: any = await this.userModel.findOne({ user_id: userId }).lean().exec();
+      if (!isProActive(user) && (trip.edits?.date_changes ?? 0) >= 1) {
+        throw new HttpException(
+          {
+            statusCode: 402,
+            code: 'EDIT_QUOTA',
+            action: 'date_change',
+            message: 'Tu as déjà décalé ce voyage une fois. Passe Pro pour décaler tes voyages autant que tu veux.',
+            error: 'Payment Required',
+          },
+          HttpStatus.PAYMENT_REQUIRED,
+        );
+      }
+    }
+    await this.assertNoOverlap(userId, start, trip.duration_days, tripId);
+    const end = this.endDateFrom(start, trip.duration_days)!;
+    const set: Record<string, any> = { start_date: start, end_date: end, cancelled_at: null };
+
     if (trip.completed_at && end >= today) set.completed_at = null;
 
     // Météo des nouveaux jours (prévisions à 16 jours, sinon tendances de saison)
@@ -110,10 +206,16 @@ export class TripsService {
       }
     }
 
-    await TripModel.updateOne({ id: tripId, user_id: userId }, { $set: set }).exec();
-    this.sharedTripModel.updateOne({ id: tripId }, { $set: set }).exec().catch(() => undefined);
+    await TripModel.updateOne(
+      { id: tripId, user_id: userId },
+      { $set: set, ...(hadDates && !trip.completed_at ? { $inc: { 'edits.date_changes': 1 } } : {}) },
+    ).exec();
+    this.sharedTripModel.updateOne({ id: tripId }, { $set: { start_date: start, end_date: end } }).exec().catch(() => undefined);
     const updated: any = await TripModel.findOne({ id: tripId }).lean().exec();
     await this.tripSchedule.reset(userId, updated);
+    // Report sans perte : l'alerte prix suit les nouvelles dates
+    const watch: any = await this.priceAlerts.status(userId, tripId).catch(() => null);
+    if (watch?.enabled) this.priceAlerts.enable(userId, tripId).catch(() => undefined);
     // Dates connues : Réservations & Budget se prépare en arrière-plan
     this.tripBookings.warmUp(userId, tripId);
     return updated;
@@ -485,6 +587,7 @@ export class TripsService {
     );
 
     await this.assertFreemiumQuota(user, TripModel);
+    await this.assertNoOverlap(user.user_id, dto.start_date, dto.duration_days);
 
     this.logger.log(`Generating trip for user ${user.user_id} (${user.name}) in ${dto.destination} [tenant: ${tenantId}]`);
 
@@ -671,6 +774,7 @@ export class TripsService {
 
     const days = Math.max(1, itinerary.duration_days || 1);
     const startDate = options.startDate?.slice(0, 10);
+    await this.assertNoOverlap(user.user_id, startDate, days);
     let endDate: string | undefined;
     if (startDate) {
       const end = new Date(`${startDate}T00:00:00Z`);

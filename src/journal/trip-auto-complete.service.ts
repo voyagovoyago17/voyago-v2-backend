@@ -9,6 +9,8 @@ import { Trip } from '../trips/schemas/trip.schema';
 import { GLOBAL_DB_CONNECTION, TENANT_DB_CONNECTION } from '../common/constants';
 import { User, UserDocument } from '../auth/schemas/user.schema';
 import { computeBudgetSummary } from '../trips/budget-summary';
+import { TripEditsService } from '../trips/trip-edits.service';
+import { isProActive } from '../pro/pro-status';
 
 /** Heure « murale » locale : un Date dont les champs UTC donnent l'heure locale. */
 function localClock(offsetMinutes: number, at = Date.now()): Date {
@@ -44,6 +46,7 @@ export class TripAutoCompleteService implements OnModuleInit, OnModuleDestroy {
     private readonly notificationsService: NotificationsService,
     @InjectModel(Trip.name, TENANT_DB_CONNECTION) private readonly sharedTripModel: Model<TripDocument>,
     @InjectModel(User.name, GLOBAL_DB_CONNECTION) private readonly userModel: Model<UserDocument>,
+    private readonly tripEdits: TripEditsService,
   ) {}
 
   /** Fuseau du voyageur (téléphone), sinon celui de la destination. */
@@ -91,7 +94,7 @@ export class TripAutoCompleteService implements OnModuleInit, OnModuleDestroy {
   private async loadTrip(entry: any): Promise<any> {
     const TripModel = await this.tenancyService.getTenantModel<TripDocument>(entry.user_id, 'Trip', TripSchema);
     return TripModel.findOne({ id: entry.trip_id, user_id: entry.user_id })
-      .select('id destination duration_days start_date weather pois gems packing_list completed_at')
+      .select('id destination duration_days start_date weather pois gems packing_list completed_at edits tribe_plan')
       .lean()
       .exec();
   }
@@ -126,6 +129,7 @@ export class TripAutoCompleteService implements OnModuleInit, OnModuleDestroy {
             data: { trip_id: entry.trip_id, packing: true, destination: entry.destination },
             dedupe_key: `departure:${entry.trip_id}:${String(trip.start_date).slice(0, 10)}`,
           });
+          if (!sameDay) await this.maybePlanB(entry, trip, 1);
         }
         await this.tripSchedule.markDepartureNotified(entry.trip_id);
       } catch (err: any) {
@@ -171,11 +175,41 @@ export class TripAutoCompleteService implements OnModuleInit, OnModuleDestroy {
             data: { trip_id: entry.trip_id, recap: true, day: tomorrow },
             dedupe_key: `recap:${entry.trip_id}:${today}`,
           });
+          if (!last && nextPois.length) await this.maybePlanB(entry, trip, tomorrow);
         }
         await this.tripSchedule.markRecapSent(entry.trip_id, today);
       } catch (err: any) {
         this.logger.warn(`Récap du soir ${entry.trip_id} : ${err.message}`);
       }
+    }
+  }
+
+  /**
+   * Plan B pluie : la veille au soir, si la pluie est annoncée sur le programme du lendemain.
+   * Pro : programme à l'abri en un geste ; gratuit : aperçu de l'avantage Pro.
+   */
+  private async maybePlanB(entry: any, trip: any, day: number) {
+    try {
+      if ((trip.edits?.plan_b_days ?? []).includes(day) || (trip.edits?.plan_b_notified ?? []).includes(day)) return;
+      if (trip.tribe_plan?.founder_id && trip.tribe_plan.founder_id !== entry.user_id) return;
+      const { rainy, summary } = await this.tripEdits.rainForecast(trip, day);
+      if (!rainy) return;
+      const user: any = await this.userModel.findOne({ user_id: entry.user_id }).select('is_pro pro_tier pro_expires_at').lean().exec();
+      const pro = !!user && isProActive(user);
+      const what = summary ? String(summary).toLowerCase() : 'de la pluie';
+      this.notificationsService.notifySafely(entry.user_id, {
+        type: 'plan_b',
+        title: pro ? `☔ Plan B pour le jour ${day} à ${entry.destination}` : `☔ Pluie annoncée le jour ${day} à ${entry.destination}`,
+        body: pro
+          ? `Demain : ${what}. Un programme à l'abri (musées, marchés couverts, cafés…) en un geste ?`
+          : `Demain : ${what}. Avec Pro, ton plan B à l'abri se prépare en un geste 💎`,
+        data: { trip_id: entry.trip_id, day, plan_b: true, pro },
+        dedupe_key: `plan_b:${entry.trip_id}:${day}`,
+      });
+      const TripModel = await this.tenancyService.getTenantModel<TripDocument>(entry.user_id, 'Trip', TripSchema);
+      await TripModel.updateOne({ id: entry.trip_id }, { $addToSet: { 'edits.plan_b_notified': day } }).exec();
+    } catch (err: any) {
+      this.logger.warn(`Plan B pluie ${entry.trip_id} : ${err.message}`);
     }
   }
 

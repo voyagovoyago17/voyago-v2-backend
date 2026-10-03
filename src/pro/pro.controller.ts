@@ -17,6 +17,11 @@ class CreateCheckoutDto {
   tier: string;
 }
 
+class EditPackCheckoutDto {
+  @IsString()
+  trip_id: string;
+}
+
 @ApiTags('💎 Voyagooo Pro & Abonnements')
 @Controller('pro')
 export class ProController {
@@ -26,6 +31,20 @@ export class ProController {
   @Get('tiers')
   getTiers() {
     return this.proService.getTiers();
+  }
+
+  @ApiOperation({ summary: 'Formule gratuite : ce qui est inclus et ce qui manque' })
+  @Get('free-plan')
+  getFreePlan() {
+    return this.proService.getFreePlan();
+  }
+
+  @ApiOperation({ summary: 'Acheter un pack de 3 modifications pour un voyage (0,99 €)' })
+  @ApiBearerAuth()
+  @Post('edit-pack')
+  @UseGuards(SessionAuthGuard)
+  async createEditPackCheckout(@CurrentUser() user: any, @Body() body: EditPackCheckoutDto) {
+    return this.proService.createEditPackCheckout(user, body.trip_id);
   }
 
   @ApiOperation({ summary: 'Créer une session de paiement Stripe Checkout' })

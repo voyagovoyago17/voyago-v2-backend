@@ -8,6 +8,7 @@ import { TripPackingService } from './trip-packing.service';
 import { TripBookingsService } from './trip-bookings.service';
 import { TravelpayoutsService } from './travelpayouts.service';
 import { PriceAlertService } from './price-alert.service';
+import { TripEditsService } from './trip-edits.service';
 import { PriceWatch, PriceWatchSchema } from './schemas/price-watch.schema';
 import { DestinationCatalogService } from '../catalog/destination-catalog.service';
 import { CatalogPlacePrice, CatalogPlacePriceSchema } from '../catalog/schemas/catalog-place-price.schema';
@@ -60,10 +61,11 @@ import { GLOBAL_DB_CONNECTION, TENANT_DB_CONNECTION } from '../common/constants'
     GamificationModule,
   ],
   controllers: [TripsController],
-  providers: [TripsService, TripGemsService, TripScheduleService, TripPackingService, TripBookingsService, TravelpayoutsService, PriceAlertService, DestinationCatalogService, SessionAuthGuard, OptionalSessionAuthGuard],
+  providers: [TripsService, TripGemsService, TripScheduleService, TripPackingService, TripBookingsService, TravelpayoutsService, PriceAlertService, TripEditsService, DestinationCatalogService, SessionAuthGuard, OptionalSessionAuthGuard],
   exports: [
     TripsService,
     TripScheduleService,
+    TripEditsService,
     MongooseModule.forFeature([{ name: Trip.name, schema: TripSchema }], TENANT_DB_CONNECTION),
   ],
 })
