@@ -138,6 +138,15 @@ export class TripsController {
     return this.tripBookingsService.add(user.user_id, trip_id, dto);
   }
 
+  /** « Prix incorrect ? » : le prix de cette visite sera revérifié pour tous */
+  @Post('trip/:trip_id/bookings/price-report')
+  @UseGuards(SessionAuthGuard)
+  async reportPrice(@CurrentUser() user: any, @Param('trip_id') trip_id: string, @Body() body: { name?: string }) {
+    const name = String(body?.name || '').trim().slice(0, 100);
+    if (!name) return { flagged: false };
+    return this.tripBookingsService.flagPrice(user.user_id, trip_id, name);
+  }
+
   @Delete('trip/:trip_id/bookings/:item_id')
   @UseGuards(SessionAuthGuard)
   async removeBooking(@CurrentUser() user: any, @Param('trip_id') trip_id: string, @Param('item_id') item_id: string) {

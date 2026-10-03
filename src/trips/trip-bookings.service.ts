@@ -11,6 +11,7 @@ import { TripDocument, TripSchema } from './schemas/trip.schema';
 import { distanceMeters } from './trip-gems.service';
 import { TravelpayoutsService } from './travelpayouts.service';
 import { PriceAlertService } from './price-alert.service';
+import { DestinationCatalogService, catalogNorm } from '../catalog/destination-catalog.service';
 import {
   AFFILIATE_PARTNERS,
   PartnerChoice,
@@ -58,6 +59,7 @@ export class TripBookingsService {
     private readonly config: ConfigService,
     private readonly travelpayouts: TravelpayoutsService,
     private readonly priceAlerts: PriceAlertService,
+    private readonly catalog: DestinationCatalogService,
     @InjectModel(User.name, GLOBAL_DB_CONNECTION) private readonly userModel: Model<UserDocument>,
   ) {}
 
@@ -303,6 +305,10 @@ export class TripBookingsService {
         price_group: price,
         advice: a.advice || null,
         image_url: poi?.image_url || null,
+        // Catalogue partagé : date du relevé et tarif saisonnier
+        priced_at: a.priced_at ?? null,
+        seasonal: !!a.seasonal,
+        price_source: a.source ?? 'ia',
         link: '',
         choices: activityChoices(a.name, trip.city || trip.destination),
       };
@@ -475,7 +481,32 @@ export class TripBookingsService {
     };
     const res = await TripModel.updateOne({ id: tripId, user_id: userId }, { $push: { bookings: item } }).exec();
     if (res.matchedCount === 0) throw new NotFoundException(`Trip ${tripId} not found`);
+    if (item.category === 'activities' && item.amount > 0) this.reportPaidActivity(userId, tripId, label, item.amount);
     return this.get(userId, tripId);
+  }
+
+  /** Visite payée : le vrai montant vient confirmer ou corriger le prix du catalogue partagé */
+  private reportPaidActivity(userId: string, tripId: string, label: string, amount: number) {
+    (async () => {
+      const trip = await this.loadTrip(userId, tripId);
+      const place = (trip.pois || []).find((p: any) => catalogNorm(p.name) === catalogNorm(label.split(' · ')[0]));
+      if (!place) return;
+      await this.catalog.reportPaid({
+        destination: trip.city || trip.destination,
+        name: place.name,
+        currency: trip.currency || 'EUR',
+        amount,
+        adults: Math.max(1, trip.travelers?.adults ?? 1),
+        kids: trip.travelers?.children_ages ?? [],
+        userId,
+      });
+    })().catch((err) => this.logger.warn(`Prix payé non pris en compte : ${err.message}`));
+  }
+
+  /** « Prix incorrect ? » sur une visite : revérifié au prochain passage */
+  async flagPrice(userId: string, tripId: string, name: string) {
+    const trip = await this.loadTrip(userId, tripId);
+    return this.catalog.flag({ destination: trip.city || trip.destination, name, currency: trip.currency || 'EUR', userId });
   }
 
   async remove(userId: string, tripId: string, itemId: string) {
@@ -629,10 +660,37 @@ export class TripBookingsService {
     nightlyCap: number,
     opts: { wait: number; retry: boolean },
   ): Promise<{ value: BookingEstimatesDraft | null; status: 'ready' | 'pending' | 'failed' }> {
-    // v3 : options d'hébergement, pass touristique, astuces
-    const basis = ['v3', trip.start_date || '', trip.duration_days, level, currency, adults, kids.join('.'), stays.length, nightlyCap].join('|');
-    if (trip.bookings_plan?.basis === basis && trip.bookings_plan?.estimates) {
-      return { value: trip.bookings_plan.estimates, status: 'ready' };
+    // v4 : hébergements propres au voyage (gardés avec lui) + visites, pass et astuces du catalogue partagé
+    const basis = ['v4', trip.start_date || '', trip.duration_days, level, currency, adults, kids.join('.'), stays.length, nightlyCap].join('|');
+    const staysCached = trip.bookings_plan?.basis === basis ? trip.bookings_plan?.stays : null;
+    const month = trip.start_date ? Number(String(trip.start_date).slice(5, 7)) || 0 : 0;
+    const catalogInput = {
+      destination: trip.city || trip.destination,
+      country: trip.country,
+      month,
+      level,
+      currency,
+      places: (trip.pois || []).filter((p: any) => p.order !== 2).map((p: any) => p.name),
+      transports: trip.transports || [],
+    };
+    const merge = (st: { stays: any[]; booking_window?: string } | null, ex: any): (BookingEstimatesDraft & { partial?: boolean }) | null => {
+      if (!st && !ex) return null;
+      return {
+        stays: st?.stays ?? [],
+        booking_window: st?.booking_window,
+        activities: ex?.activities ?? [],
+        local_transport: ex?.local_transport,
+        meals_per_person_per_day: ex?.meals_per_person_per_day,
+        city_pass: ex?.city_pass,
+        money_tips: ex?.money_tips ?? [],
+        partial: !st || !ex,
+      };
+    };
+
+    // Chemin rapide : hébergements déjà estimés et catalogue déjà rempli (lecture en base, sans IA)
+    if (staysCached && !opts.retry) {
+      const ex = await this.withTimeout(this.catalog.extras(catalogInput), Math.max(opts.wait, 1500));
+      if (ex) return { value: merge(staysCached, ex), status: 'ready' };
     }
 
     const key = `${userId}:${trip.id}:${basis}`;
@@ -646,42 +704,47 @@ export class TripBookingsService {
       this.pending.set(
         key,
         (async () => {
-          let estimates: (BookingEstimatesDraft & { partial?: boolean }) | null = null;
-          try {
-            estimates = await this.aiService.estimateBookings({
-              destination: trip.city || trip.destination,
-              country: trip.country,
-              level,
-              currency,
-              start_date: trip.start_date,
-              adults,
-              children_ages: kids,
-              stays: stays.map((s) => ({
-                index: s.index,
-                days: s.fromDay === s.toDay ? `jour ${s.fromDay}` : `jours ${s.fromDay} à ${s.toDay}`,
-                near: s.near,
-              })),
-              places: (trip.pois || []).filter((p: any) => p.order !== 2).map((p: any) => p.name),
-              transports: trip.transports || [],
-              nightly_cap: nightlyCap || undefined,
-            });
-          } catch (err: any) {
-            this.logger.warn(`Estimations ${trip.id} : ${err.message}`);
-          }
-          if (estimates && !estimates.partial) {
-            // Complet : gardé avec le voyage
-            const { partial, ...complete } = estimates;
+          const [st, ex] = await Promise.all([
+            staysCached
+              ? Promise.resolve(staysCached)
+              : this.aiService
+                  .estimateStays({
+                    destination: trip.city || trip.destination,
+                    country: trip.country,
+                    level,
+                    currency,
+                    start_date: trip.start_date,
+                    adults,
+                    children_ages: kids,
+                    stays: stays.map((s) => ({
+                      index: s.index,
+                      days: s.fromDay === s.toDay ? `jour ${s.fromDay}` : `jours ${s.fromDay} à ${s.toDay}`,
+                      near: s.near,
+                    })),
+                    transports: trip.transports || [],
+                    nightly_cap: nightlyCap || undefined,
+                  })
+                  .catch((err) => {
+                    this.logger.warn(`Hébergements ${trip.id} : ${err.message}`);
+                    return null;
+                  }),
+            this.catalog.extras(catalogInput).catch((err) => {
+              this.logger.warn(`Catalogue ${catalogInput.destination} : ${err.message}`);
+              return null;
+            }),
+          ]);
+          if (st && !staysCached) {
             const TripModel = await this.tripModel(userId);
             await TripModel.updateOne(
               { id: trip.id, user_id: userId },
-              { $set: { bookings_plan: { basis, estimates: complete, generated_at: new Date() } } },
+              { $set: { bookings_plan: { basis, stays: st, generated_at: new Date() } } },
             ).exec();
-            this.recent.delete(key);
-          } else {
-            // Partiel ou échec : servi tel quel 10 min, puis nouvel essai
-            this.recent.set(key, { at: Date.now(), value: estimates });
           }
-          return estimates;
+          const merged = merge(st, ex);
+          // Partiel ou échec : servi tel quel 10 min, puis nouvel essai
+          if (!merged || merged.partial) this.recent.set(key, { at: Date.now(), value: merged });
+          else this.recent.delete(key);
+          return merged;
         })().finally(() => this.pending.delete(key)),
       );
     }

@@ -9,6 +9,9 @@ import { TripBookingsService } from './trip-bookings.service';
 import { TravelpayoutsService } from './travelpayouts.service';
 import { PriceAlertService } from './price-alert.service';
 import { PriceWatch, PriceWatchSchema } from './schemas/price-watch.schema';
+import { DestinationCatalogService } from '../catalog/destination-catalog.service';
+import { CatalogPlacePrice, CatalogPlacePriceSchema } from '../catalog/schemas/catalog-place-price.schema';
+import { CatalogDestination, CatalogDestinationSchema } from '../catalog/schemas/catalog-destination.schema';
 import { TripSchedule, TripScheduleSchema } from './schemas/trip-schedule.schema';
 import { Trip, TripSchema } from './schemas/trip.schema';
 import { CommunityMember, CommunityMemberSchema } from '../community/schemas/community-member.schema';
@@ -45,6 +48,9 @@ import { GLOBAL_DB_CONNECTION, TENANT_DB_CONNECTION } from '../common/constants'
         { name: TripSchedule.name, schema: TripScheduleSchema },
         // Alertes prix sur les vols des voyages
         { name: PriceWatch.name, schema: PriceWatchSchema },
+        // Catalogue partagé : prix des lieux et fiches des destinations, générés une fois pour tous
+        { name: CatalogPlacePrice.name, schema: CatalogPlacePriceSchema },
+        { name: CatalogDestination.name, schema: CatalogDestinationSchema },
       ],
       GLOBAL_DB_CONNECTION,
     ),
@@ -54,7 +60,7 @@ import { GLOBAL_DB_CONNECTION, TENANT_DB_CONNECTION } from '../common/constants'
     GamificationModule,
   ],
   controllers: [TripsController],
-  providers: [TripsService, TripGemsService, TripScheduleService, TripPackingService, TripBookingsService, TravelpayoutsService, PriceAlertService, SessionAuthGuard, OptionalSessionAuthGuard],
+  providers: [TripsService, TripGemsService, TripScheduleService, TripPackingService, TripBookingsService, TravelpayoutsService, PriceAlertService, DestinationCatalogService, SessionAuthGuard, OptionalSessionAuthGuard],
   exports: [
     TripsService,
     TripScheduleService,

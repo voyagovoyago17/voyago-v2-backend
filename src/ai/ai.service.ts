@@ -1,4 +1,8 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
+import { InjectModel } from '@nestjs/mongoose';
+import { Model } from 'mongoose';
+import { CatalogImage, CatalogImageDocument } from '../catalog/schemas/catalog-image.schema';
+import { GLOBAL_DB_CONNECTION } from '../common/constants';
 import { ConfigService } from '@nestjs/config';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import Anthropic from '@anthropic-ai/sdk';
@@ -175,7 +179,7 @@ export interface BookingEstimatesDraft {
     /** Autres façons de dormir sur cette étape, dont au moins une sous le plafond */
     options?: { kind: string; area: string; nightly_min: number; nightly_max: number; why: string }[];
   }[];
-  activities: { name: string; price_adult: number; price_child?: number; advice?: string }[];
+  activities: { name: string; price_adult: number; price_child?: number; advice?: string; priced_at?: Date; seasonal?: boolean; source?: string }[];
   local_transport?: { name: string; price_per_day: number; tip?: string };
   meals_per_person_per_day?: number;
   /** Pass touristique de la ville, à comparer aux billets à l'unité */
@@ -232,7 +236,7 @@ const BOOKING_EXTRAS_SCHEMA: ResponseSchema = {
   properties: {
     activities: {
       type: SchemaType.ARRAY,
-      maxItems: 20,
+      maxItems: 25,
       items: {
         type: SchemaType.OBJECT,
         properties: {
@@ -240,6 +244,8 @@ const BOOKING_EXTRAS_SCHEMA: ResponseSchema = {
           price_adult: { type: SchemaType.NUMBER },
           price_child: { type: SchemaType.NUMBER },
           advice: { type: SchemaType.STRING },
+          peak_price_adult: { type: SchemaType.NUMBER },
+          peak_months: { type: SchemaType.ARRAY, maxItems: 12, items: { type: SchemaType.INTEGER } },
         },
         required: ['name', 'price_adult'],
       },
@@ -445,7 +451,13 @@ export class AiService {
   private genAI: GoogleGenerativeAI | null = null;
   private anthropic: Anthropic | null = null;
 
-  constructor(private readonly configService: ConfigService) {
+  /** Recherches d'images en cours (une seule requête par lieu, même si plusieurs voyages la demandent) */
+  private readonly imageLookups = new Map<string, Promise<string | null>>();
+
+  constructor(
+    private readonly configService: ConfigService,
+    @Optional() @InjectModel(CatalogImage.name, GLOBAL_DB_CONNECTION) private readonly imageModel?: Model<CatalogImageDocument>,
+  ) {
     const geminiKey = this.configService.get<string>('GEMINI_API_KEY');
     if (geminiKey) {
       this.genAI = new GoogleGenerativeAI(geminiKey);
@@ -866,10 +878,10 @@ Réponds avec UNIQUEMENT un objet JSON : {"suggestions":[{"destination":"...","c
   }
 
   /**
-   * Réservations & Budget : deux demandes courtes en parallèle (hébergements / visites & astuces),
-   * chacune bornée en taille et en temps. Résultat partiel possible ; null si les deux échouent.
+   * Réservations & Budget, partie propre au voyage : quartiers et alternatives d'hébergement selon
+   * l'itinéraire, le groupe et le budget. Les visites, pass et astuces viennent du catalogue partagé.
    */
-  async estimateBookings(input: {
+  async estimateStays(input: {
     destination: string;
     country?: string;
     level: string;
@@ -878,11 +890,10 @@ Réponds avec UNIQUEMENT un objet JSON : {"suggestions":[{"destination":"...","c
     adults: number;
     children_ages: number[];
     stays: { index: number; days: string; near: string[] }[];
-    places: string[];
     transports: string[];
     /** Plafond par nuit pour tout le groupe, tiré du budget */
     nightly_cap?: number;
-  }): Promise<(BookingEstimatesDraft & { partial?: boolean }) | null> {
+  }): Promise<{ stays: BookingEstimatesDraft['stays']; booking_window?: string } | null> {
     const kids = input.children_ages.length ? `, enfants de ${input.children_ages.join(', ')} ans` : '';
     const month = input.start_date ? new Date(`${input.start_date.slice(0, 10)}T12:00:00Z`).toLocaleDateString('fr-FR', { month: 'long' }) : null;
     const people = input.adults + input.children_ages.length;
@@ -908,19 +919,6 @@ ${input.stays.slice(0, 8).map((s) => `- ${s.index} · ${s.days} · ${s.near.slic
 Réponds en JSON compact :
 - "stays" : UNE entrée par étape ci-dessus, pas plus. "area" (quartier réel où dormir), "why" (15 mots max : proximité, ambiance, sécurité${input.children_ages.length ? ', familles' : ''}), "nightly_min"/"nightly_max" (une nuit pour les ${people} voyageurs, chambres adaptées, standing ${input.level}), "tip" (12 mots max), "options" : EXACTEMENT 3 autres façons de dormir (pension, appartement, auberge en chambre privée, hôtel 3★…), chacune "kind" (4 mots max), "area", "nightly_min", "nightly_max", "why" (12 mots max : ce qu'on gagne, ce qu'on sacrifie).${input.nightly_cap ? ` Au moins 2 options SOUS ${input.nightly_cap} ${input.currency}.` : ''}
 - "booking_window" : quand réserver pour ces dates (14 mots max).
-N'invente ni remise ni partenariat. Uniquement le JSON, sans répétition.`;
-
-    const extrasPrompt = `Tu es Voyago, conseiller voyage local. Donne des tarifs officiels RÉALISTES.
-${context}
-
-Lieux de l'itinéraire : ${input.places.slice(0, 20).join(' ; ')}
-
-Réponds en JSON compact :
-- "activities" : uniquement les lieux PAYANTS de la liste (nom EXACT, chacun une seule fois, 20 max), "price_adult", "price_child" (0 si gratuit), "advice" (10 mots max, ex : "Gratuit le 1er dimanche"). Omets les lieux gratuits et restaurants.
-- "local_transport" : meilleur pass ou mode local (nom réel), "price_per_day" par personne, "tip".
-- "meals_per_person_per_day" : budget repas par adulte et par jour, standing ${input.level}.
-- "city_pass" : SEULEMENT si un vrai pass couvre au moins 2 lieux payants de la liste : "name", "price_adult", "price_child", "covers" (noms exacts, 15 max), "tip". Sinon omets-le.
-- "money_tips" : EXACTEMENT 3 astuces locales concrètes pour dépenser moins (14 mots max chacune).
 N'invente ni remise ni partenariat. Uniquement le JSON, sans répétition.`;
 
     const parseStays = (raw: any) => {
@@ -956,20 +954,69 @@ N'invente ni remise ni partenariat. Uniquement le JSON, sans répétition.`;
       return { stays, booking_window: raw.booking_window ? String(raw.booking_window).trim().slice(0, 120) : undefined };
     };
 
-    const parseExtras = (raw: any) => {
+    return this.runBoundedJson('Booking stays', staysPrompt, BOOKING_STAYS_SCHEMA, parseStays, 2048);
+  }
+
+  /**
+   * Fiche partagée d'une destination (catalogue) : prix d'entrée officiels des lieux demandés,
+   * tarifs de haute saison, transport local, repas, pass touristique, astuces. Indépendante du voyageur.
+   */
+  async estimateDestinationExtras(input: {
+    destination: string;
+    country?: string;
+    month: number;
+    level: string;
+    currency: string;
+    /** Lieux à tarifer (seulement ceux absents ou périmés dans le catalogue) */
+    places: string[];
+    transports: string[];
+    /** Faut-il aussi la fiche (transport, repas, pass, astuces) ? */
+    with_destination: boolean;
+  }): Promise<{
+    places: { name: string; price_adult: number; price_child: number; peak_price_adult?: number; peak_months?: number[]; advice?: string }[];
+    local_transport?: { name: string; price_per_day: number; tip?: string };
+    meals_per_person_per_day?: number;
+    city_pass?: { name: string; price_adult: number; price_child?: number; covers: string[]; tip?: string };
+    money_tips?: string[];
+  } | null> {
+    if (!input.places.length && !input.with_destination) return { places: [] };
+    const monthName = input.month ? new Date(Date.UTC(2026, input.month - 1, 15)).toLocaleDateString('fr-FR', { month: 'long' }) : null;
+    const num = (v: any) => (typeof v === 'number' && isFinite(v) && v >= 0 ? Math.round(v) : 0);
+    const prompt = `Tu es Voyago, conseiller voyage local. Donne les tarifs OFFICIELS actuels, réalistes, en ${input.currency}.
+Destination : ${input.destination}${input.country ? ` (${input.country})` : ''}${monthName ? `, voyage en ${monthName}` : ''}, standing ${input.level}.
+${input.places.length ? `\nLieux à tarifer : ${input.places.slice(0, 25).join(' ; ')}\n` : ''}
+Réponds en JSON compact :
+${input.places.length ? `- "activities" : UNE entrée par lieu de la liste (nom EXACT), y compris les gratuits (price_adult 0). "price_adult", "price_child" (0 si gratuit pour les enfants), "advice" (10 mots max, ex : "Gratuit le 1er dimanche"). Si le tarif change selon la saison : "peak_price_adult" (tarif haute saison) et "peak_months" (numéros des mois concernés). Restaurants et rues : 0.\n` : ''}${input.with_destination ? `- "local_transport" : meilleur pass ou mode local (nom réel), "price_per_day" par personne, "tip".
+- "meals_per_person_per_day" : budget repas par adulte et par jour, standing ${input.level}.
+- "city_pass" : SEULEMENT si un vrai pass touristique existe dans cette ville : "name", "price_adult", "price_child", "covers" (lieux couverts, 15 max), "tip". Sinon omets-le.
+- "money_tips" : EXACTEMENT 3 astuces locales concrètes pour dépenser moins${monthName ? ` en ${monthName}` : ''} (14 mots max chacune).
+` : ''}N'invente ni remise ni partenariat. Uniquement le JSON, sans répétition.`;
+
+    const parse = (raw: any) => {
       if (!raw || typeof raw !== 'object') return null;
+      const seen = new Set<string>();
+      const places = (Array.isArray(raw.activities) ? raw.activities : [])
+        .filter((a: any) => typeof a?.name === 'string' && a.name.trim())
+        .filter((a: any) => {
+          const k = a.name.trim().toLowerCase();
+          if (seen.has(k)) return false;
+          seen.add(k);
+          return true;
+        })
+        .slice(0, 25)
+        .map((a: any) => ({
+          name: a.name.trim().slice(0, 80),
+          price_adult: num(a.price_adult),
+          price_child: num(a.price_child),
+          peak_price_adult: num(a.peak_price_adult) || undefined,
+          peak_months: Array.isArray(a.peak_months)
+            ? [...new Set<number>(a.peak_months.map((m: any) => Number(m)).filter((m: number) => m >= 1 && m <= 12))]
+            : undefined,
+          advice: a.advice ? String(a.advice).trim().slice(0, 90) : undefined,
+        }));
+      if (input.places.length && !places.length && !input.with_destination) return null;
       return {
-        activities: uniq(
-          (Array.isArray(raw.activities) ? raw.activities : []).filter((a: any) => typeof a?.name === 'string' && num(a.price_adult) > 0),
-          (a: any) => a.name.trim(),
-        )
-          .slice(0, 20)
-          .map((a: any) => ({
-            name: a.name.trim().slice(0, 80),
-            price_adult: num(a.price_adult),
-            price_child: num(a.price_child),
-            advice: a.advice ? String(a.advice).trim().slice(0, 90) : undefined,
-          })),
+        places,
         local_transport:
           raw.local_transport && typeof raw.local_transport.name === 'string'
             ? {
@@ -992,22 +1039,7 @@ N'invente ni remise ni partenariat. Uniquement le JSON, sans répétition.`;
         money_tips: [...new Set<string>((Array.isArray(raw.money_tips) ? raw.money_tips : []).filter((t: any) => typeof t === 'string' && t.trim()).map((t: string) => t.trim().slice(0, 120)))].slice(0, 3),
       };
     };
-
-    const [stays, extras] = await Promise.all([
-      this.runBoundedJson('Booking stays', staysPrompt, BOOKING_STAYS_SCHEMA, parseStays, 2048),
-      this.runBoundedJson('Booking extras', extrasPrompt, BOOKING_EXTRAS_SCHEMA, parseExtras, 2048),
-    ]);
-    if (!stays && !extras) return null;
-    return {
-      stays: stays?.stays ?? [],
-      booking_window: stays?.booking_window,
-      activities: extras?.activities ?? [],
-      local_transport: extras?.local_transport,
-      meals_per_person_per_day: extras?.meals_per_person_per_day,
-      city_pass: extras?.city_pass,
-      money_tips: extras?.money_tips ?? [],
-      partial: !stays || !extras,
-    };
+    return this.runBoundedJson(`Catalogue ${input.destination}`, prompt, BOOKING_EXTRAS_SCHEMA, parse, 2048);
   }
 
   /**
@@ -1900,7 +1932,54 @@ Réponds STRICTEMENT en JSON :
     };
   }
 
+  /**
+   * Image d'un lieu : cherchée une seule fois, stockée dans le catalogue partagé, puis servie à tous.
+   * Aucune image trouvée : mémorisé aussi, nouvel essai après 7 jours.
+   */
   async fetchWikipediaImage(imageQuery: string, fallbackUrl?: string): Promise<string | null> {
+    const found = await this.catalogImage(imageQuery);
+    return found || fallbackUrl || this.getCuratedPhoto('culture', imageQuery);
+  }
+
+  private async catalogImage(query: string): Promise<string | null> {
+    const key = (query || '')
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, ' ')
+      .trim()
+      .slice(0, 200);
+    if (!key) return null;
+    if (!this.imageModel) return this.searchWikimediaImage(query);
+    try {
+      const doc: any = await this.imageModel.findOne({ key }).lean().exec();
+      if (doc?.url) {
+        this.imageModel.updateOne({ key }, { $inc: { hits: 1 } }).exec().catch(() => undefined);
+        return doc.url;
+      }
+      if (doc && Date.now() - new Date(doc.checked_at).getTime() < 7 * 24 * 3600_000) return null;
+    } catch {
+      return this.searchWikimediaImage(query);
+    }
+    if (!this.imageLookups.has(key)) {
+      this.imageLookups.set(
+        key,
+        this.searchWikimediaImage(query)
+          .then(async (url) => {
+            await this.imageModel!
+              .updateOne({ key }, { $set: { query, url, checked_at: new Date() }, $setOnInsert: { hits: 0 } }, { upsert: true })
+              .exec()
+              .catch(() => undefined);
+            return url;
+          })
+          .finally(() => this.imageLookups.delete(key)),
+      );
+    }
+    return this.imageLookups.get(key)!;
+  }
+
+  /** Recherche en ligne (Wikimedia Commons, puis Wikipédia EN et FR) ; null si rien de trouvé */
+  private async searchWikimediaImage(imageQuery: string): Promise<string | null> {
     try {
       // 1. Essai prioritaire Wikimedia Commons (Photos de monuments en haute définition)
       const commonsUrl = 'https://commons.wikimedia.org/w/api.php';
@@ -2004,7 +2083,7 @@ Réponds STRICTEMENT en JSON :
       }
     } catch (_) {}
 
-    return fallbackUrl || this.getCuratedPhoto('culture', imageQuery);
+    return null;
   }
 
   /** Décalage horaire (minutes) d'un lieu, via Open-Meteo ; repli sur la longitude. */
