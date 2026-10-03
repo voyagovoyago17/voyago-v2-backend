@@ -20,6 +20,8 @@ import {
 } from './schemas/circle-challenge-completion.schema';
 import { PlaceReview, PlaceReviewSchema } from '../places/schemas/place-review.schema';
 import { TribeTripsService } from './tribe-trips.service';
+import { CircleAccessService } from './circle-access.service';
+import { CircleJoinRequest, CircleJoinRequestSchema } from './schemas/circle-join-request.schema';
 import { CircleChallengesService } from './circle-challenges.service';
 import { NotificationsModule } from '../notifications/notifications.module';
 import { SessionAuthGuard } from '../common/guards/session-auth.guard';
@@ -44,6 +46,7 @@ import { GLOBAL_DB_CONNECTION, TENANT_DB_CONNECTION } from '../common/constants'
         { name: CircleTripPlan.name, schema: CircleTripPlanSchema },
         { name: CircleTripVote.name, schema: CircleTripVoteSchema },
         { name: CircleChallengeCompletion.name, schema: CircleChallengeCompletionSchema },
+        { name: CircleJoinRequest.name, schema: CircleJoinRequestSchema },
       ],
       TENANT_DB_CONNECTION,
     ),
@@ -62,7 +65,14 @@ import { GLOBAL_DB_CONNECTION, TENANT_DB_CONNECTION } from '../common/constants'
     NotificationsModule,
   ],
   controllers: [CommunityController],
-  providers: [CommunityService, CommunitySocialService, TribeTripsService, CircleChallengesService, SessionAuthGuard],
+  providers: [
+    CommunityService,
+    CommunitySocialService,
+    TribeTripsService,
+    CircleChallengesService,
+    CircleAccessService,
+    SessionAuthGuard,
+  ],
   exports: [CommunityService],
 })
 export class CommunityModule {}

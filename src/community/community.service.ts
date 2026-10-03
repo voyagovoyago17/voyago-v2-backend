@@ -19,6 +19,7 @@ import { ShareTripToCircleDto } from './dto/share-trip.dto';
 
 import { GLOBAL_DB_CONNECTION, TENANT_DB_CONNECTION } from '../common/constants';
 import { TripsService } from '../trips/trips.service';
+import { CircleAccessService } from './circle-access.service';
 import { canViewTrip, tribeMateIds, tripVisibility, widerVisibility } from '../trips/trip-visibility';
 
 /** Nombre de likes qui rend un voyage « populaire » (XP + badge pour son auteur) */
@@ -43,6 +44,7 @@ export class CommunityService {
     private readonly tenancyService: TenancyService,
     private readonly gamificationService: GamificationService,
     private readonly tripsService: TripsService,
+    private readonly circleAccess: CircleAccessService,
   ) {}
 
   // =========================================================================
@@ -366,12 +368,12 @@ export class CommunityService {
     const effectiveUserId = await this.resolveUserId(query.my_user_id, authHeader);
     const viewerId = await this.authUserId(authHeader);
 
-    // Cercles publics + cercles privés dont le voyageur connecté est membre
+    // Cercles publics + privés visibles (cadenas, sur demande) + mes cercles secrets
     const myPrivateCircleIds: string[] = viewerId
       ? await this.memberModel.distinct('circle_id', { user_id: viewerId }).exec()
       : [];
     const filter: any = {
-      $and: [{ $or: [{ is_public: true }, { id: { $in: myPrivateCircleIds } }] }],
+      $and: [{ $or: [{ is_public: true }, { listed: { $ne: false } }, { id: { $in: myPrivateCircleIds } }] }],
     };
 
     if (query.category && query.category !== 'all') {
@@ -433,6 +435,18 @@ export class CommunityService {
     const postCountMap = new Map(postCounts.map((p: any) => [p._id, p.count]));
     const tripCountMap = new Map(tripCounts.map((t: any) => [t._id, t.count]));
 
+    // Cercles privés : état de ma demande ; cercles que je gère : demandes en attente
+    const lockedIds = circles.filter((c) => !c.is_public && !myJoinedCircleIds.has(c.id)).map((c) => c.id);
+    const managedIds: string[] = viewerId
+      ? await this.memberModel
+          .distinct('circle_id', { user_id: viewerId, circle_id: { $in: circleIds }, role: { $in: ['creator', 'admin'] } })
+          .exec()
+      : [];
+    const [requestStatuses, pendingCounts] = await Promise.all([
+      this.circleAccess.myRequestStatuses(viewerId, lockedIds),
+      this.circleAccess.pendingCounts(managedIds),
+    ]);
+
     const creatorIds = [...new Set(circles.map((c) => c.creator_id))];
     const creators: any[] = await this.userModel
       .find({ user_id: { $in: creatorIds } })
@@ -471,6 +485,12 @@ export class CommunityService {
         posts_count: realPostsCount,
         trips_count: realTripsCount,
         is_member: myJoinedCircleIds.has(circle.id),
+        is_locked: !circle.is_public && !myJoinedCircleIds.has(circle.id),
+        listed: circle.listed !== false,
+        join_rules: this.circleAccess.activeRules(circle),
+        auto_approve: !!circle.auto_approve,
+        my_request_status: requestStatuses.get(circle.id) || null,
+        pending_requests_count: pendingCounts.get(circle.id) || 0,
         creator: creator
           ? {
               user_id: creator.user_id,
@@ -502,7 +522,14 @@ export class CommunityService {
     }
 
     const viewerId = await this.authUserId(authHeader);
-    const viewerMembership: any = await this.assertCircleAccess(circle, viewerId);
+    const viewerMembership: any = viewerId
+      ? await this.memberModel.findOne({ circle_id: circle.id, user_id: viewerId }).lean().exec()
+      : null;
+    if (!circle.is_public && !viewerMembership) {
+      // Cercle secret : n'existe pas pour les non-membres
+      if (circle.listed === false) throw new NotFoundException('Cercle introuvable');
+      return this.lockedCirclePreview(circle, viewerId);
+    }
     const canManageInvites = ['creator', 'admin'].includes(viewerMembership?.role);
 
     const effectiveUserId = await this.resolveUserId(currentUserId, authHeader);
@@ -558,8 +585,17 @@ export class CommunityService {
       .exec();
     const memberMap = new Map(memberUsers.map((u) => [u.user_id, u]));
 
+    const access = await this.circleAccess.accessInfo(circle, viewerId, realMembersCount);
+    const pendingRequests = canManageInvites
+      ? (await this.circleAccess.pendingCounts([circle.id])).get(circle.id) || 0
+      : 0;
+
     return {
       ...this.withoutInviteCode(circle),
+      ...access,
+      is_locked: false,
+      listed: circle.listed !== false,
+      pending_requests_count: pendingRequests,
       // Code d'invitation réservé au créateur et aux admins du cercle privé
       invite_code: canManageInvites && !circle.is_public ? circle.invite_code || null : null,
       members_count: realMembersCount,
@@ -590,6 +626,50 @@ export class CommunityService {
           joined_at: m.joined_at,
         };
       }),
+    };
+  }
+
+  /** Cercle privé vu de l'extérieur : vitrine + conditions d'accès, sans son contenu. */
+  private async lockedCirclePreview(circle: any, viewerId?: string): Promise<object> {
+    const [membersCount, creator] = await Promise.all([
+      this.memberModel.countDocuments({ circle_id: circle.id }).exec(),
+      this.userModel.findOne({ user_id: circle.creator_id }).lean().exec() as Promise<any>,
+    ]);
+    const access = await this.circleAccess.accessInfo(circle, viewerId, membersCount);
+    return {
+      id: circle.id,
+      name: circle.name,
+      slug: circle.slug,
+      description: circle.description,
+      avatar_emoji: circle.avatar_emoji,
+      cover_image_url: circle.cover_image_url,
+      category: circle.category,
+      destination_city: circle.destination_city,
+      destination_country: circle.destination_country,
+      tags: circle.tags || [],
+      is_public: false,
+      listed: true,
+      is_locked: true,
+      is_member: false,
+      my_role: null,
+      invite_code: null,
+      members_count: membersCount,
+      posts_count: circle.posts_count || 0,
+      trips_count: circle.trips_count || 0,
+      created_at: circle.created_at,
+      creator: creator
+        ? {
+            user_id: creator.user_id,
+            name: creator.name,
+            pseudo: creator.pseudo || null,
+            avatar_emoji: creator.avatar_emoji || null,
+            picture: creator.picture || null,
+            is_pro: creator.is_pro || false,
+          }
+        : null,
+      members_sample: [],
+      pending_requests_count: 0,
+      ...access,
     };
   }
 
@@ -627,6 +707,12 @@ export class CommunityService {
       is_public: isPublic,
       ...(isPublic ? {} : { invite_code: await this.generateInviteCode() }),
       tags: dto.tags || [],
+      listed: dto.listed !== false,
+      join_rules: Object.fromEntries(
+        Object.entries(dto.join_rules || {}).filter(([, v]) => v !== null && v !== undefined && v !== false && v !== 0),
+      ),
+      auto_approve: !!dto.auto_approve,
+      join_question: dto.join_question?.trim() || '',
       created_at: new Date(),
       updated_at: new Date(),
     };
@@ -650,12 +736,11 @@ export class CommunityService {
     if (!circle) {
       throw new NotFoundException(`Cercle ${circleId} introuvable`);
     }
-    if (!circle.is_public) {
-      const member = await this.memberModel.exists({ circle_id: circleId, user_id: userId });
-      if (!member) {
-        throw new ForbiddenException("Ce cercle est privé : rejoins-le avec son code d'invitation");
-      }
+    const alreadyMember = await this.memberModel.exists({ circle_id: circleId, user_id: userId });
+    if (!circle.is_public && !alreadyMember) {
+      throw new ForbiddenException("Ce cercle est privé : demande à le rejoindre ou utilise son code d'invitation");
     }
+    if (!alreadyMember) await this.circleAccess.assertCanJoin(circle, userId);
     return this.addMember(userId, circle);
   }
 
@@ -666,7 +751,13 @@ export class CommunityService {
     if (!circle) {
       throw new NotFoundException("Code d'invitation invalide");
     }
-    return { ...(await this.addMember(userId, circle)), slug: circle.slug, name: circle.name };
+    // Le code dispense de la demande, pas des conditions d'accès du cercle
+    if (!(await this.memberModel.exists({ circle_id: circle.id, user_id: userId }))) {
+      await this.circleAccess.assertCanJoin(circle, userId);
+    }
+    const joined = await this.addMember(userId, circle);
+    await this.circleAccess.resolvePendingOnJoin(circle.id, userId);
+    return { ...joined, slug: circle.slug, name: circle.name };
   }
 
   /** Nouveau code d'invitation : l'ancien ne fonctionne plus (créateur / admin uniquement). */

@@ -1,4 +1,6 @@
-import { IsString, IsNotEmpty, IsOptional, IsBoolean, IsArray } from 'class-validator';
+import { IsString, IsNotEmpty, IsOptional, IsBoolean, IsArray, MaxLength, ValidateNested } from 'class-validator';
+import { Type } from 'class-transformer';
+import { JoinRulesDto } from './circle-access.dto';
 
 export class CreateCircleDto {
   @IsString()
@@ -36,4 +38,23 @@ export class CreateCircleDto {
   @IsArray()
   @IsOptional()
   tags?: string[];
+
+  /** Cercle privé visible dans la liste (false = cercle secret, accessible par code) */
+  @IsBoolean()
+  @IsOptional()
+  listed?: boolean;
+
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => JoinRulesDto)
+  join_rules?: JoinRulesDto;
+
+  @IsBoolean()
+  @IsOptional()
+  auto_approve?: boolean;
+
+  @IsString()
+  @IsOptional()
+  @MaxLength(200)
+  join_question?: string;
 }

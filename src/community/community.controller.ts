@@ -3,6 +3,7 @@ import {
   Get,
   Post,
   Delete,
+  Patch,
   Body,
   Param,
   Query,
@@ -22,6 +23,8 @@ import { ReportContentDto } from './dto/report.dto';
 import { CommunitySocialService } from './community-social.service';
 import { TribeTripsService } from './tribe-trips.service';
 import { CircleChallengesService } from './circle-challenges.service';
+import { CircleAccessService } from './circle-access.service';
+import { JoinRequestDto, UpdateCircleAccessDto } from './dto/circle-access.dto';
 import { CreateTripPlanDto, JoinTripPlanDto, VoteTripPlanDto } from './dto/create-trip-plan.dto';
 import { COMMENT_TARGET_TYPES, CommentTargetType } from './schemas/community-comment.schema';
 import { ApiTags, ApiBearerAuth, ApiOperation } from '@nestjs/swagger';
@@ -34,6 +37,7 @@ export class CommunityController {
     private readonly socialService: CommunitySocialService,
     private readonly tribeTripsService: TribeTripsService,
     private readonly challengesService: CircleChallengesService,
+    private readonly circleAccessService: CircleAccessService,
   ) {}
 
   // =========================================================================
@@ -148,6 +152,46 @@ export class CommunityController {
     @Param('id') id: string,
   ) {
     return this.communityService.joinCircle(user.user_id, id);
+  }
+
+  /** Demander à rejoindre un cercle privé (refus automatique si les conditions ne sont pas remplies) */
+  @Post('circles/:id/join-requests')
+  @UseGuards(SessionAuthGuard)
+  async requestJoin(@CurrentUser() user: any, @Param('id') id: string, @Body() dto: JoinRequestDto) {
+    return this.circleAccessService.requestJoin(user.user_id, id, dto.message);
+  }
+
+  /** Annuler ma demande en attente */
+  @Delete('circles/:id/join-requests')
+  @UseGuards(SessionAuthGuard)
+  async cancelJoinRequest(@CurrentUser() user: any, @Param('id') id: string) {
+    return this.circleAccessService.cancelRequest(user.user_id, id);
+  }
+
+  /** Demandes reçues, avec le profil des voyageurs (fondateur / admins) */
+  @Get('circles/:id/join-requests')
+  @UseGuards(SessionAuthGuard)
+  async listJoinRequests(@CurrentUser() user: any, @Param('id') id: string, @Query('status') status?: string) {
+    return this.circleAccessService.listRequests(user.user_id, id, status || 'pending');
+  }
+
+  @Post('join-requests/:requestId/accept')
+  @UseGuards(SessionAuthGuard)
+  async acceptJoinRequest(@CurrentUser() user: any, @Param('requestId') requestId: string) {
+    return this.circleAccessService.decide(user.user_id, requestId, 'accept');
+  }
+
+  @Post('join-requests/:requestId/reject')
+  @UseGuards(SessionAuthGuard)
+  async rejectJoinRequest(@CurrentUser() user: any, @Param('requestId') requestId: string) {
+    return this.circleAccessService.decide(user.user_id, requestId, 'reject');
+  }
+
+  /** Conditions d'accès, acceptation automatique, question d'entrée, cercle secret */
+  @Patch('circles/:id/access')
+  @UseGuards(SessionAuthGuard)
+  async updateCircleAccess(@CurrentUser() user: any, @Param('id') id: string, @Body() dto: UpdateCircleAccessDto) {
+    return this.circleAccessService.updateSettings(user.user_id, id, dto);
   }
 
   /** Générer un nouveau code d'invitation (créateur / admin d'un cercle privé) */
