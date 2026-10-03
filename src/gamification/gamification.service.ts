@@ -35,8 +35,8 @@ const XP_ACTIONS: Record<string, number> = {
   chasseur_pepites: 5,
   compte_verifie: 5,
   // Fondateurs de tribus
-  fondateur_reactif: 2,
-  fondateur_actif: 15,
+  fondateur_reactif: 1,
+  fondateur_actif: 1,
 };
 
 /** Actions attribuées uniquement par le serveur (jamais via POST /profile/xp). */
@@ -657,7 +657,7 @@ export class GamificationService {
       { id: 'compte_verifie', title: 'Compte Vérifié', description: 'Adresse e-mail confirmée', emoji: '✅', xp_reward: 5 },
       { id: 'chasseur_pepites', title: 'Chasseur de Pépites', description: 'Première pépite ramassée sur le terrain', emoji: '💎', xp_reward: 5 },
       { id: 'esprit_tribu', title: 'Esprit de Tribu', description: 'Premier défi de cercle réussi avec ta tribu', emoji: '🏕️', xp_reward: 15 },
-      { id: 'fondateur_actif', title: 'Fondateur Actif', description: '5 demandes de tribu traitées en moins de 24 h', emoji: '⚡', xp_reward: 15 },
+      { id: 'fondateur_actif', title: 'Fondateur Actif', description: '5 demandes de tribu traitées en moins de 24 h', emoji: '⚡', xp_reward: 1 },
       { id: 'voyago_pro', title: 'Voyago Pro', description: 'Membre Pro Voyago', emoji: '💎', xp_reward: 0 },
     ];
   }
