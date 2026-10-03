@@ -7,6 +7,7 @@ import { PlaceReview, PlaceReviewDocument } from '../places/schemas/place-review
 import { placeKey } from '../places/place-key';
 import { JournalEntry, JournalEntryDocument, JournalEntrySchema } from './schemas/journal-entry.schema';
 import { UpsertJournalEntryDto } from './dto/upsert-entry.dto';
+import { TripScheduleService } from '../trips/trip-schedule.service';
 import { isTripPast, tripBadge, tripDistanceKm, tripEndDate } from './journal-utils';
 import { TenancyService } from '../tenancy/tenancy.service';
 import { GamificationService } from '../gamification/gamification.service';
@@ -32,6 +33,7 @@ export class JournalService {
     private readonly notificationsService: NotificationsService,
     private readonly uploadService: UploadService,
     private readonly tripsService: TripsService,
+    private readonly tripSchedule: TripScheduleService,
   ) {}
 
   private tripModel(userId: string) {
@@ -252,6 +254,8 @@ export class JournalService {
 
     const trip: any = await TripModel.findOne({ id: tripId }).select('destination completed_at start_date end_date duration_days').lean().exec();
     if (completedAt) {
+      // Terminé à la main : plus de clôture automatique (un voyage rouvert le reste aussi)
+      this.tripSchedule.markProcessed(tripId).catch(() => undefined);
       this.notificationsService.notifySafely(userId, {
         type: 'system',
         title: `Ton journal de ${trip.destination} est prêt 📖`,

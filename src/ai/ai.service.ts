@@ -506,6 +506,19 @@ Réponds avec UNIQUEMENT un objet JSON compact : {"gems":[{"name":"...","teaser"
 
       dateContext = `
 - Dates : du ${startFormatted} au ${endFormatted}. Adapte l'itinéraire aux jours réels de la semaine (fermetures hebdomadaires des musées, marchés et animations du week-end) et à la saison à ${dto.destination}.`;
+
+      // Calendrier jour par jour : l'IA place marchés, fermetures et événements au bon jour
+      if (!isNaN(start.getTime()) && dto.duration_days <= 21) {
+        const days = Array.from({ length: dto.duration_days }, (_, i) => {
+          const d = new Date(start.getTime() + i * 86400000);
+          return `Jour ${i + 1} = ${d.toLocaleDateString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long' })}`;
+        });
+        dateContext += `
+- Calendrier : ${days.join(' ; ')}. Un lieu habituellement fermé ce jour-là (ex. musée fermé le lundi) ne doit pas y être programmé ; profite des marchés du jour, des fêtes locales ou jours fériés connus à ces dates, et mentionne-les dans insider_tip.`;
+      }
+    } else {
+      dateContext = `
+- Dates : non précisées. Propose un itinéraire valable toute l'année : évite les événements datés et privilégie les lieux ouverts tous les jours ; signale dans insider_tip les jours de fermeture habituels à vérifier.`;
     }
 
     const paceDetails =

@@ -1,10 +1,13 @@
 import {
   Injectable,
   NotFoundException,
+  BadRequestException,
   HttpException,
   HttpStatus,
   Logger,
 } from '@nestjs/common';
+import { TripScheduleService } from './trip-schedule.service';
+import { UpdateTripDatesDto } from './dto/update-trip-dates.dto';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import { v4 as uuidv4 } from 'uuid';
@@ -49,6 +52,7 @@ export class TripsService {
     private readonly aiService: AiService,
     private readonly tenancyService: TenancyService,
     private readonly notificationsService: NotificationsService,
+    private readonly tripSchedule: TripScheduleService,
   ) {}
 
   /**
@@ -65,6 +69,51 @@ export class TripsService {
     clearTimeout(timer);
   }
 
+  /** Dernier jour (AAAA-MM-JJ) d'un voyage de `days` jours commençant le `start`. */
+  private endDateFrom(start?: string, days?: number): string | undefined {
+    if (!start || !/^\d{4}-\d{2}-\d{2}/.test(start)) return undefined;
+    const end = new Date(`${start.slice(0, 10)}T00:00:00Z`);
+    if (isNaN(end.getTime())) return undefined;
+    end.setUTCDate(end.getUTCDate() + Math.max((days || 1) - 1, 0));
+    return end.toISOString().slice(0, 10);
+  }
+
+  /**
+   * Ajoute ou change les dates d'un voyage : fin recalculée, météo rafraîchie,
+   * clôture automatique reprogrammée (un voyage terminé redaté dans le futur revient sur la carte).
+   */
+  async updateDates(userId: string, tripId: string, dto: UpdateTripDatesDto) {
+    const TripModel = await this.tenancyService.getTenantModel<TripDocument>(userId, 'Trip', TripSchema);
+    const trip: any = await TripModel.findOne({ id: tripId, user_id: userId }).lean().exec();
+    if (!trip) throw new NotFoundException(`Trip ${tripId} not found`);
+
+    const start = dto.start_date.slice(0, 10);
+    if (isNaN(new Date(`${start}T00:00:00Z`).getTime())) {
+      throw new BadRequestException('Date de début invalide');
+    }
+    const end = this.endDateFrom(start, trip.duration_days)!;
+    const set: Record<string, any> = { start_date: start, end_date: end };
+
+    const today = new Date().toISOString().slice(0, 10);
+    if (trip.completed_at && end >= today) set.completed_at = null;
+
+    // Météo des nouveaux jours (prévisions à 16 jours, sinon tendances de saison)
+    const firstPoi = (trip.pois || []).find((p: any) => p.lat && p.lng);
+    if (firstPoi) {
+      try {
+        set.weather = await this.aiService.fetchWeather(firstPoi.lat, firstPoi.lng, trip.duration_days, start);
+      } catch (err: any) {
+        this.logger.warn(`Météo non rafraîchie pour ${tripId}: ${err.message}`);
+      }
+    }
+
+    await TripModel.updateOne({ id: tripId, user_id: userId }, { $set: set }).exec();
+    this.sharedTripModel.updateOne({ id: tripId }, { $set: set }).exec().catch(() => undefined);
+    const updated: any = await TripModel.findOne({ id: tripId }).lean().exec();
+    await this.tripSchedule.reset(userId, updated);
+    return updated;
+  }
+
   async getUserTrips(
     user_id: string,
     options: { viewerId?: string } = {},
@@ -77,6 +126,8 @@ export class TripsService {
     );
 
     let trips = await TripModel.find({ user_id }).sort({ created_at: -1 }).exec();
+    // Voyages datés créés avant le registre des fins : clôture automatique programmée
+    if (options.viewerId === user_id) this.tripSchedule.syncUser(user_id, trips.map((t: any) => t.toObject?.() ?? t));
 
     // If no trips in tenant DB yet, check legacy shared DB
     if (!trips || trips.length === 0) {
@@ -449,7 +500,8 @@ export class TripsService {
       country_code: dto.country_code,
       cover_image_url: monument.imageUrl,
       start_date: dto.start_date,
-      end_date: dto.end_date,
+      // Fin toujours renseignée quand le début est connu (début + durée)
+      end_date: dto.end_date || this.endDateFrom(dto.start_date, dto.duration_days),
       duration_days: dto.duration_days,
       pace: dto.pace,
       transports: dto.transports,
@@ -464,6 +516,7 @@ export class TripsService {
     };
 
     const trip = await TripModel.create(tripData);
+    this.tripSchedule.register(user.user_id, tripData);
 
     // 4. Mirror to shared DB for community feed (public & tribe trips only)
     if (visibility !== 'private') {
@@ -644,6 +697,7 @@ export class TripsService {
       created_at: new Date(),
     });
 
+    this.tripSchedule.register(user.user_id, trip.toObject ? trip.toObject() : trip);
     await this.rewardTripCreation(user, ProfileModel);
     return trip;
   }

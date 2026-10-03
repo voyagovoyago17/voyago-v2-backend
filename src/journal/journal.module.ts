@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { MongooseModule } from '@nestjs/mongoose';
 import { JournalController } from './journal.controller';
 import { JournalService } from './journal.service';
+import { TripAutoCompleteService } from './trip-auto-complete.service';
 import { Trip, TripSchema } from '../trips/schemas/trip.schema';
 import { PlaceReview, PlaceReviewSchema } from '../places/schemas/place-review.schema';
 import { User, UserSchema } from '../auth/schemas/user.schema';
@@ -32,6 +33,6 @@ import { GLOBAL_DB_CONNECTION, TENANT_DB_CONNECTION } from '../common/constants'
     TripsModule,
   ],
   controllers: [JournalController],
-  providers: [JournalService, SessionAuthGuard],
+  providers: [JournalService, TripAutoCompleteService, SessionAuthGuard],
 })
 export class JournalModule {}

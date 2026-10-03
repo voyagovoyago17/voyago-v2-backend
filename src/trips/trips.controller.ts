@@ -17,6 +17,7 @@ import { UpdateTripVisibilityDto } from './dto/update-visibility.dto';
 import { RemixTripDto } from './dto/remix-trip.dto';
 import { CollectGemDto } from './dto/collect-gem.dto';
 import { TripGemsService } from './trip-gems.service';
+import { UpdateTripDatesDto } from './dto/update-trip-dates.dto';
 
 @ApiTags('✈️ Voyages & Itinéraires IA')
 @Controller()
@@ -46,6 +47,15 @@ export class TripsController {
     // Authenticated owners are looked up in their tenant DB first;
     // otherwise the public lookup falls through to the shared DB
     return this.tripsService.getTripById(trip_id, user?.user_id);
+  }
+
+  /** Ajouter ou changer les dates d'un voyage (la fin découle de la durée) */
+  @ApiOperation({ summary: "Ajouter ou modifier les dates d'un voyage (météo et clôture automatique mises à jour)" })
+  @ApiBearerAuth()
+  @Patch('trip/:trip_id/dates')
+  @UseGuards(SessionAuthGuard)
+  async updateDates(@CurrentUser() user: any, @Param('trip_id') trip_id: string, @Body() dto: UpdateTripDatesDto) {
+    return this.tripsService.updateDates(user.user_id, trip_id, dto);
   }
 
   /** Rendre un voyage privé, visible par sa tribu ou public */

@@ -3,6 +3,8 @@ import { MongooseModule } from '@nestjs/mongoose';
 import { TripsController } from './trips.controller';
 import { TripsService } from './trips.service';
 import { TripGemsService } from './trip-gems.service';
+import { TripScheduleService } from './trip-schedule.service';
+import { TripSchedule, TripScheduleSchema } from './schemas/trip-schedule.schema';
 import { Trip, TripSchema } from './schemas/trip.schema';
 import { CommunityMember, CommunityMemberSchema } from '../community/schemas/community-member.schema';
 import { UserBlock, UserBlockSchema } from '../community/schemas/user-block.schema';
@@ -34,6 +36,8 @@ import { GLOBAL_DB_CONNECTION, TENANT_DB_CONNECTION } from '../common/constants'
       [
         { name: User.name, schema: UserSchema },
         { name: UserSession.name, schema: UserSessionSchema },
+        // Fins de voyage : clôture automatique vers le journal
+        { name: TripSchedule.name, schema: TripScheduleSchema },
       ],
       GLOBAL_DB_CONNECTION,
     ),
@@ -43,9 +47,10 @@ import { GLOBAL_DB_CONNECTION, TENANT_DB_CONNECTION } from '../common/constants'
     GamificationModule,
   ],
   controllers: [TripsController],
-  providers: [TripsService, TripGemsService, SessionAuthGuard, OptionalSessionAuthGuard],
+  providers: [TripsService, TripGemsService, TripScheduleService, SessionAuthGuard, OptionalSessionAuthGuard],
   exports: [
     TripsService,
+    TripScheduleService,
     MongooseModule.forFeature([{ name: Trip.name, schema: TripSchema }], TENANT_DB_CONNECTION),
   ],
 })
