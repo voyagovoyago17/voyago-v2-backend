@@ -164,6 +164,58 @@ const NEXT_DESTINATIONS_SCHEMA: ResponseSchema = {
   required: ['suggestions'],
 };
 
+export interface BookingEstimatesDraft {
+  stays: { index: number; area: string; why: string; nightly_min: number; nightly_max: number; tip?: string }[];
+  activities: { name: string; price_adult: number; price_child?: number; advice?: string }[];
+  local_transport?: { name: string; price_per_day: number; tip?: string };
+  meals_per_person_per_day?: number;
+}
+
+const BOOKING_ESTIMATES_SCHEMA: ResponseSchema = {
+  type: SchemaType.OBJECT,
+  properties: {
+    stays: {
+      type: SchemaType.ARRAY,
+      items: {
+        type: SchemaType.OBJECT,
+        properties: {
+          index: { type: SchemaType.INTEGER },
+          area: { type: SchemaType.STRING },
+          why: { type: SchemaType.STRING },
+          nightly_min: { type: SchemaType.NUMBER },
+          nightly_max: { type: SchemaType.NUMBER },
+          tip: { type: SchemaType.STRING },
+        },
+        required: ['index', 'area', 'why', 'nightly_min', 'nightly_max'],
+      },
+    },
+    activities: {
+      type: SchemaType.ARRAY,
+      items: {
+        type: SchemaType.OBJECT,
+        properties: {
+          name: { type: SchemaType.STRING },
+          price_adult: { type: SchemaType.NUMBER },
+          price_child: { type: SchemaType.NUMBER },
+          advice: { type: SchemaType.STRING },
+        },
+        required: ['name', 'price_adult'],
+      },
+    },
+    local_transport: {
+      type: SchemaType.OBJECT,
+      properties: {
+        name: { type: SchemaType.STRING },
+        price_per_day: { type: SchemaType.NUMBER },
+        tip: { type: SchemaType.STRING },
+      },
+      required: ['name', 'price_per_day'],
+    },
+    meals_per_person_per_day: { type: SchemaType.NUMBER },
+  },
+  required: ['stays', 'activities'],
+};
+
 const PACKING_RESPONSE_SCHEMA: ResponseSchema = {
   type: SchemaType.OBJECT,
   properties: {
@@ -712,6 +764,105 @@ Réponds avec UNIQUEMENT un objet JSON : {"suggestions":[{"destination":"...","c
       }
     }
     return [];
+  }
+
+  /**
+   * Réservations & Budget : quartier où dormir pour chaque étape, fourchette de prix par nuit,
+   * prix d'entrée des visites, pass de transport local. Estimations indicatives (à vérifier).
+   */
+  async estimateBookings(input: {
+    destination: string;
+    country?: string;
+    level: string;
+    currency: string;
+    start_date?: string;
+    adults: number;
+    children_ages: number[];
+    stays: { index: number; days: string; near: string[] }[];
+    places: string[];
+    transports: string[];
+  }): Promise<BookingEstimatesDraft | null> {
+    const kids = input.children_ages.length ? `, enfants de ${input.children_ages.join(', ')} ans` : '';
+    const prompt = `Tu es Voyago, expert des réservations de voyage et du budget. Donne des estimations RÉALISTES et prudentes en ${input.currency}.
+Voyage : ${input.destination}${input.country ? ` (${input.country})` : ''}, standing ${input.level}${input.start_date ? `, départ le ${input.start_date}` : ''}.
+Voyageurs : ${input.adults} adulte(s)${kids}. Déplacements : ${input.transports.join(', ') || 'marche'}.
+
+Étapes d'hébergement (index, jours, lieux visités à proximité) :
+${input.stays.map((s) => `- ${s.index} · ${s.days} · ${s.near.slice(0, 4).join(', ')}`).join('\n')}
+
+Lieux de l'itinéraire : ${input.places.slice(0, 20).join(' ; ')}
+
+Réponds :
+- "stays" : pour chaque étape, le quartier idéal où dormir ("area", nom réel), "why" (1 phrase, 15 mots max : proximité, ambiance, sécurité, famille), "nightly_min"/"nightly_max" = prix réaliste d'une nuit pour TOUT le groupe au standing ${input.level}, "tip" (conseil de réservation, 12 mots max).
+- "activities" : uniquement les lieux PAYANTS de la liste (nom exact), "price_adult" et "price_child" (0 si gratuit pour les enfants), "advice" (ex : "Réserver en ligne : file d'attente évitée", 10 mots max). Omets les lieux gratuits et les restaurants.
+- "local_transport" : le meilleur pass ou mode local (nom réel, ex : carte Navegante, Suica), "price_per_day" par personne, "tip".
+- "meals_per_person_per_day" : budget repas réaliste par adulte et par jour au standing ${input.level}.
+N'invente jamais de remise ni de partenariat. Réponds avec UNIQUEMENT l'objet JSON.`;
+
+    const parse = (text: string): BookingEstimatesDraft | null => {
+      const raw = JSON.parse(text.replace(/```json/g, '').replace(/```/g, '').trim());
+      if (!raw || !Array.isArray(raw.stays)) return null;
+      const num = (v: any) => (typeof v === 'number' && isFinite(v) && v >= 0 ? Math.round(v) : 0);
+      return {
+        stays: raw.stays
+          .filter((s: any) => typeof s?.area === 'string')
+          .map((s: any) => ({
+            index: Number(s.index) || 1,
+            area: s.area.trim().slice(0, 60),
+            why: String(s.why || '').trim().slice(0, 140),
+            nightly_min: num(s.nightly_min),
+            nightly_max: Math.max(num(s.nightly_max), num(s.nightly_min)),
+            tip: s.tip ? String(s.tip).trim().slice(0, 100) : undefined,
+          })),
+        activities: (Array.isArray(raw.activities) ? raw.activities : [])
+          .filter((a: any) => typeof a?.name === 'string' && num(a.price_adult) > 0)
+          .slice(0, 20)
+          .map((a: any) => ({
+            name: a.name.trim().slice(0, 80),
+            price_adult: num(a.price_adult),
+            price_child: num(a.price_child),
+            advice: a.advice ? String(a.advice).trim().slice(0, 90) : undefined,
+          })),
+        local_transport:
+          raw.local_transport && typeof raw.local_transport.name === 'string'
+            ? {
+                name: raw.local_transport.name.trim().slice(0, 60),
+                price_per_day: num(raw.local_transport.price_per_day),
+                tip: raw.local_transport.tip ? String(raw.local_transport.tip).trim().slice(0, 100) : undefined,
+              }
+            : undefined,
+        meals_per_person_per_day: num(raw.meals_per_person_per_day) || undefined,
+      };
+    };
+
+    if (this.genAI) {
+      for (const modelName of ['gemini-3.5-flash-lite', 'gemini-flash-lite-latest', 'gemini-flash-latest']) {
+        try {
+          const model = this.genAI.getGenerativeModel({
+            model: modelName,
+            generationConfig: { responseMimeType: 'application/json', responseSchema: BOOKING_ESTIMATES_SCHEMA, temperature: 0.3 },
+          });
+          const result = parse((await model.generateContent(prompt)).response.text());
+          if (result) return result;
+        } catch (err: any) {
+          this.logger.warn(`Booking estimates with ${modelName} failed: ${err.message}`);
+        }
+      }
+    }
+    if (this.anthropic) {
+      try {
+        const message = await this.anthropic.messages.create({
+          model: 'claude-haiku-4-5',
+          max_tokens: 2500,
+          messages: [{ role: 'user', content: prompt }],
+        });
+        const textBlock = message.content.find((b): b is Anthropic.TextBlock => b.type === 'text');
+        if (textBlock) return parse(textBlock.text);
+      } catch (err: any) {
+        this.logger.warn(`Booking estimates with Claude failed: ${err.message}`);
+      }
+    }
+    return null;
   }
 
   /** Les pépites ne sont demandées que pour un voyage classique (pas pour un vote de tribu). */

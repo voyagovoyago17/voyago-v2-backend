@@ -21,6 +21,8 @@ import { TripGemsService } from './trip-gems.service';
 import { UpdateTripDatesDto } from './dto/update-trip-dates.dto';
 import { TripPackingService } from './trip-packing.service';
 import { AddPackingItemDto, TogglePackingItemDto } from './dto/packing.dto';
+import { TripBookingsService } from './trip-bookings.service';
+import { AddTripBookingDto } from './dto/bookings.dto';
 
 @ApiTags('✈️ Voyages & Itinéraires IA')
 @Controller()
@@ -29,6 +31,7 @@ export class TripsController {
     private readonly tripsService: TripsService,
     private readonly tripGemsService: TripGemsService,
     private readonly tripPackingService: TripPackingService,
+    private readonly tripBookingsService: TripBookingsService,
   ) {}
 
   @ApiOperation({ summary: 'Obtenir tous les voyages d’un utilisateur (privés et/ou publics)' })
@@ -83,6 +86,27 @@ export class TripsController {
   @UseGuards(SessionAuthGuard)
   async removePackingItem(@CurrentUser() user: any, @Param('trip_id') trip_id: string, @Param('item_id') item_id: string) {
     return this.tripPackingService.removeItem(user.user_id, trip_id, item_id);
+  }
+
+  /** Réservations & Budget : hébergements, transports et activités selon le budget, et suivi des dépenses */
+  @ApiOperation({ summary: 'Réservations & Budget du voyage : propositions selon le budget et prestations réservées' })
+  @ApiBearerAuth()
+  @Get('trip/:trip_id/bookings')
+  @UseGuards(SessionAuthGuard)
+  async getBookings(@CurrentUser() user: any, @Param('trip_id') trip_id: string) {
+    return this.tripBookingsService.get(user.user_id, trip_id);
+  }
+
+  @Post('trip/:trip_id/bookings')
+  @UseGuards(SessionAuthGuard)
+  async addBooking(@CurrentUser() user: any, @Param('trip_id') trip_id: string, @Body() dto: AddTripBookingDto) {
+    return this.tripBookingsService.add(user.user_id, trip_id, dto);
+  }
+
+  @Delete('trip/:trip_id/bookings/:item_id')
+  @UseGuards(SessionAuthGuard)
+  async removeBooking(@CurrentUser() user: any, @Param('trip_id') trip_id: string, @Param('item_id') item_id: string) {
+    return this.tripBookingsService.remove(user.user_id, trip_id, item_id);
   }
 
   /** Ajouter ou changer les dates d'un voyage (la fin découle de la durée) */

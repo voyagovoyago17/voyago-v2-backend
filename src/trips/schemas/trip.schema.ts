@@ -139,6 +139,13 @@ export class Trip {
   @Prop({ type: Object, default: null })
   travelers?: { party: string; adults: number; children_ages: number[] } | null;
 
+  /** Réservations & Budget : estimations IA (mises en cache) et prestations réservées */
+  @Prop({ type: Object, default: null })
+  bookings_plan?: Record<string, any> | null;
+
+  @Prop({ type: [Object], default: [] })
+  bookings?: Record<string, any>[];
+
   /** « Et maintenant ? » : idées de prochain voyage (générées une fois, à la fin du voyage) */
   @Prop({ type: Object, default: null })
   next_suggestions?: Record<string, any> | null;
