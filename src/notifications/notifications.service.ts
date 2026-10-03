@@ -9,7 +9,7 @@ import { GLOBAL_DB_CONNECTION } from '../common/constants';
 import { PushService } from './push/push.service';
 import { Observable, Subject, filter, interval, map, merge } from 'rxjs';
 import { User, UserDocument } from '../auth/schemas/user.schema';
-import { DEFAULT_PREFS, Delivery, NotificationPrefs, SOCIAL_BURST_WINDOW_MS, SOCIAL_TYPES, decideDelivery, prefsOf } from './notification-policy';
+import { Delivery, NotificationPrefs, SOCIAL_BURST_WINDOW_MS, SOCIAL_TYPES, decideDelivery, prefsOf } from './notification-policy';
 
 /** Types déjà affichés à l'écran par l'app au moment où ils naissent : pas de push en double. */
 const IN_APP_ONLY_TYPES: NotificationType[] = ['arrival'];
@@ -41,7 +41,10 @@ export class NotificationsService implements OnModuleInit {
     return merge(
       this.live$.pipe(
         filter((e) => e.userId === userId),
-        map((e) => ({ type: 'notification', data: { ...e.notification, sound: e.delivery.sound, priority: e.delivery.priority } })),
+        map((e) => ({
+          type: 'notification',
+          data: { ...e.notification, sound: e.delivery.sound, vibrate: e.delivery.vibrate, priority: e.delivery.priority },
+        })),
       ),
       interval(25000).pipe(map(() => ({ type: 'ping', data: { t: Date.now() } }))),
     );
@@ -53,9 +56,15 @@ export class NotificationsService implements OnModuleInit {
   }
 
   async updatePrefs(userId: string, changes: Partial<NotificationPrefs>): Promise<NotificationPrefs> {
-    const set: Record<string, boolean> = {};
-    for (const k of Object.keys(DEFAULT_PREFS) as (keyof NotificationPrefs)[]) {
+    const set: Record<string, boolean | string> = {};
+    for (const k of ['social', 'quiet_hours'] as const) {
       if (typeof changes[k] === 'boolean') set[`notification_prefs.${k}`] = changes[k] as boolean;
+    }
+    // Le mode fait foi ; « sound » seul (anciennes versions) bascule entre son et vibration
+    const mode = changes.mode ?? (typeof changes.sound === 'boolean' ? (changes.sound ? 'sound' : 'vibrate') : undefined);
+    if (mode) {
+      set['notification_prefs.mode'] = mode;
+      set['notification_prefs.sound'] = mode === 'sound';
     }
     if (Object.keys(set).length) await this.userModel.updateOne({ user_id: userId }, { $set: set }).exec();
     return this.getPrefs(userId);
@@ -211,6 +220,7 @@ export class NotificationsService implements OnModuleInit {
         body: n.body,
         imageUrl: n.data?.image_url,
         sound: delivery.sound,
+        vibrate: delivery.vibrate,
         collapseKey: delivery.collapse_key,
         threadId: delivery.priority === 'social' ? 'social' : n.type,
         // L'app lit « payload » pour ouvrir le bon écran, comme depuis la cloche
@@ -219,6 +229,7 @@ export class NotificationsService implements OnModuleInit {
           type: n.type,
           payload: n.data,
           sound: delivery.sound ? '1' : '0',
+          vibrate: delivery.vibrate ? '1' : '0',
           priority: delivery.priority,
         },
       });
@@ -242,7 +253,7 @@ export class NotificationsService implements OnModuleInit {
     const n = this.toDto(doc.toObject());
     const deviceList = await this.pushService.describeDevices(userId);
     const devices = deviceList.length;
-    this.live$.next({ userId, notification: n, delivery: { push: true, sound: true, priority: 'important' } });
+    this.live$.next({ userId, notification: n, delivery: { push: true, sound: true, vibrate: true, priority: 'important' } });
     const push = await this.pushService.sendToUser(userId, {
       title: n.title,
       body: n.body,

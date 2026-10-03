@@ -7,7 +7,7 @@ import * as admin from 'firebase-admin';
 import { DeviceToken, DeviceTokenDocument, DevicePlatform } from '../schemas/device-token.schema';
 import { User, UserDocument } from '../../auth/schemas/user.schema';
 import { GLOBAL_DB_CONNECTION } from '../../common/constants';
-import { ANDROID_QUIET_CHANNEL, ANDROID_SIGNATURE_CHANNEL, IOS_SIGNATURE_SOUND, SIGNATURE_SOUND } from '../notification-policy';
+import { ANDROID_QUIET_CHANNEL, ANDROID_SIGNATURE_CHANNEL, ANDROID_VIBRATE_CHANNEL, IOS_SIGNATURE_SOUND, SIGNATURE_SOUND } from '../notification-policy';
 
 /** Nombre maximal d'appareils gardés par compte (les plus anciens sont oubliés). */
 const MAX_DEVICES_PER_USER = 10;
@@ -31,6 +31,8 @@ export interface PushMessage {
   imageUrl?: string | null;
   /** Son signature Voyagooo (sinon notification silencieuse) */
   sound?: boolean;
+  /** Sans son : vibrer quand même (canal Android dédié) */
+  vibrate?: boolean;
   /** Les push de même clé se remplacent au lieu de s'empiler (ex. commentaires d'un même voyage) */
   collapseKey?: string;
   /** Regroupement iOS dans le centre de notifications */
@@ -181,7 +183,7 @@ export class PushService implements OnModuleInit {
           priority: 'high',
           ...(message.collapseKey ? { collapseKey: message.collapseKey } : {}),
           notification: {
-            channelId: withSound ? ANDROID_SIGNATURE_CHANNEL : ANDROID_QUIET_CHANNEL,
+            channelId: withSound ? ANDROID_SIGNATURE_CHANNEL : message.vibrate ? ANDROID_VIBRATE_CHANNEL : ANDROID_QUIET_CHANNEL,
             ...(withSound ? { sound: SIGNATURE_SOUND } : {}),
             ...(message.collapseKey ? { tag: message.collapseKey } : {}),
           },

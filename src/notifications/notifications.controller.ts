@@ -1,6 +1,6 @@
 import { Body, Controller, Delete, Get, HttpCode, MessageEvent, Param, Patch, Post, Query, Sse, UseGuards } from '@nestjs/common';
 import { Observable } from 'rxjs';
-import { IsBoolean, IsOptional } from 'class-validator';
+import { IsBoolean, IsIn, IsOptional } from 'class-validator';
 import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
 import { NotificationsService } from './notifications.service';
 import { SessionAuthGuard } from '../common/guards/session-auth.guard';
@@ -10,6 +10,10 @@ import { RegisterDeviceDto, UnregisterDeviceDto } from './dto/register-device.dt
 import { PushService } from './push/push.service';
 
 class NotificationPrefsDto {
+  @IsOptional()
+  @IsIn(['sound', 'vibrate', 'silent'])
+  mode?: 'sound' | 'vibrate' | 'silent';
+
   @IsOptional()
   @IsBoolean()
   sound?: boolean;

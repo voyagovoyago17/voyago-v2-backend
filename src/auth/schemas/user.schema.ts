@@ -75,7 +75,7 @@ export class User {
 
   /** Préférences de notification : son signature, push sociaux, heures calmes */
   @Prop({ type: Object, default: null })
-  notification_prefs: { sound?: boolean; social?: boolean; quiet_hours?: boolean } | null;
+  notification_prefs: { mode?: string; sound?: boolean; social?: boolean; quiet_hours?: boolean } | null;
 
   /** Essai offert « refaire une journée » utilisé (gratuit, un seul voyage) */
   @Prop({ default: false })
