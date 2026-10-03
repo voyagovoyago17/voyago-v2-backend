@@ -6,6 +6,7 @@ import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { AppModule } from './app.module';
 import helmet from 'helmet';
 import * as express from 'express';
+import { landingPage, privacyPage } from './landing/landing.pages';
 
 // Ensure DNS resolvers handle SRV records reliably for Atlas
 try {
@@ -166,6 +167,17 @@ async function bootstrap() {
       .swagger-ui .filter .operation-filter-input { border-radius: 8px; border: 1.5px solid #58CC02; padding: 8px 12px; }
     `,
   });
+
+  // 7b. Pages publiques à la racine du domaine (présentation & confidentialité)
+  const contactEmail = process.env.CONTACT_EMAIL || undefined;
+  const landingHtml = landingPage(contactEmail);
+  const privacyHtml = privacyPage(contactEmail);
+  const http = app.getHttpAdapter().getInstance() as express.Express;
+  const sendPage = (html: string) => (_req: express.Request, res: express.Response) => {
+    res.set('Cache-Control', 'public, max-age=3600').type('html').send(html);
+  };
+  http.get('/', sendPage(landingHtml));
+  http.get(['/confidentialite', '/privacy'], sendPage(privacyHtml));
 
   // 8. Port Configuration (Port 3333 default)
   const port = parseInt(process.env.PORT || '3333', 10);
