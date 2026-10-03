@@ -98,7 +98,7 @@ export class TripAutoCompleteService implements OnModuleInit, OnModuleDestroy {
             type: 'system',
             title: `✈️ Départ demain pour ${entry.destination} !`,
             body: `${weather}${packing}`.trim(),
-            data: { trip_id: entry.trip_id, packing: true },
+            data: { trip_id: entry.trip_id, packing: true, destination: entry.destination },
             dedupe_key: `departure:${entry.trip_id}:${String(trip.start_date).slice(0, 10)}`,
           });
         }
