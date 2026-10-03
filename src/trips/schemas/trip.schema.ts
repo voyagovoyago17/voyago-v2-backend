@@ -128,6 +128,10 @@ export class Trip {
   @Prop({ type: Date, default: null })
   completed_at?: Date | null;
 
+  /** « Et maintenant ? » : idées de prochain voyage (générées une fois, à la fin du voyage) */
+  @Prop({ type: Object, default: null })
+  next_suggestions?: Record<string, any> | null;
+
   /** Valise : liste à préparer (générée par l'IA, cochée par le voyageur) */
   @Prop({ type: Object, default: null })
   packing_list?: Record<string, any> | null;

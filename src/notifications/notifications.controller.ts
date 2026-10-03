@@ -21,7 +21,7 @@ export class NotificationsController {
   @ApiOperation({ summary: 'Enregistrer le jeton push FCM d’un appareil mobile' })
   @Post('devices')
   async registerDevice(@CurrentUser() user: any, @Body() dto: RegisterDeviceDto) {
-    return this.pushService.registerDevice(user.user_id, dto.token, dto.platform, dto.app_version);
+    return this.pushService.registerDevice(user.user_id, dto.token, dto.platform, dto.app_version, dto.utc_offset_minutes);
   }
 
   /** Oublie l'appareil (déconnexion) : il ne reçoit plus les push de ce compte. */

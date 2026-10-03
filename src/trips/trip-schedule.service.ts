@@ -4,6 +4,7 @@ import { Model } from 'mongoose';
 import { TripSchedule, TripScheduleDocument } from './schemas/trip-schedule.schema';
 import { tripEndDate } from '../journal/journal-utils';
 import { GLOBAL_DB_CONNECTION } from '../common/constants';
+import { AiService } from '../ai/ai.service';
 
 /** Marge après le dernier jour avant la clôture auto (couvre tous les fuseaux horaires) */
 export const AUTO_COMPLETE_DELAY_MS = 30 * 3600 * 1000;
@@ -15,7 +16,15 @@ export class TripScheduleService {
   constructor(
     @InjectModel(TripSchedule.name, GLOBAL_DB_CONNECTION)
     private readonly scheduleModel: Model<TripScheduleDocument>,
+    private readonly aiService: AiService,
   ) {}
+
+  /** Décalage horaire de la destination, d'après le premier lieu du voyage. */
+  private async destinationOffset(trip: any): Promise<number | null> {
+    const poi = (trip?.pois || []).find((p: any) => p.lat && p.lng);
+    if (!poi) return null;
+    return this.aiService.fetchUtcOffsetMinutes(Number(poi.lat), Number(poi.lng));
+  }
 
   /** Enregistre (ou met à jour) la fin d'un voyage daté. Ne lève jamais d'erreur. */
   async register(userId: string, trip: any): Promise<void> {
@@ -25,12 +34,16 @@ export class TripScheduleService {
         await this.scheduleModel.deleteOne({ trip_id: trip?.id }).exec();
         return;
       }
+      const existing: any = await this.scheduleModel.findOne({ trip_id: trip.id }).select('dest_utc_offset_minutes').lean().exec();
+      const destOffset =
+        existing?.dest_utc_offset_minutes ?? (await this.destinationOffset(trip).catch(() => null));
       await this.scheduleModel
         .updateOne(
           { trip_id: trip.id },
           {
             $set: {
               user_id: userId,
+              dest_utc_offset_minutes: destOffset,
               destination: trip.destination || '',
               end_date: end,
               start_date: trip.start_date ? new Date(`${String(trip.start_date).slice(0, 10)}T00:00:00Z`) : null,
@@ -65,7 +78,10 @@ export class TripScheduleService {
       const known = new Set(
         (
           await this.scheduleModel
-            .find({ trip_id: { $in: dated.map((t) => t.id) }, $or: [{ start_date: { $ne: null } }, { processed_at: { $ne: null } }] })
+            .find({
+              trip_id: { $in: dated.map((t) => t.id) },
+              $or: [{ start_date: { $ne: null }, dest_utc_offset_minutes: { $ne: null } }, { processed_at: { $ne: null } }],
+            })
             .select('trip_id')
             .lean()
             .exec()
@@ -94,7 +110,7 @@ export class TripScheduleService {
       .find({
         processed_at: null,
         departure_notified_at: null,
-        start_date: { $gt: new Date(now - 12 * 3600 * 1000), $lte: new Date(now + 30 * 3600 * 1000) },
+        start_date: { $gt: new Date(now - 36 * 3600 * 1000), $lte: new Date(now + 48 * 3600 * 1000) },
       })
       .limit(limit)
       .lean()
@@ -102,10 +118,15 @@ export class TripScheduleService {
   }
 
   /** Voyages en cours aujourd'hui (UTC) dont le récap du soir n'a pas été envoyé. */
-  ongoing(today: string, limit = 500) {
-    const day = new Date(`${today}T00:00:00Z`);
+  /** Voyages en cours (à ±1 jour près, selon le fuseau de la destination). */
+  ongoing(limit = 500) {
+    const now = Date.now();
     return this.scheduleModel
-      .find({ processed_at: null, start_date: { $lte: day }, end_date: { $gte: day }, last_recap_on: { $ne: today } })
+      .find({
+        processed_at: null,
+        start_date: { $lte: new Date(now + 24 * 3600 * 1000) },
+        end_date: { $gte: new Date(now - 48 * 3600 * 1000) },
+      })
       .limit(limit)
       .lean()
       .exec();

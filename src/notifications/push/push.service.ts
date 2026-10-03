@@ -5,6 +5,7 @@ import { Model } from 'mongoose';
 import * as fs from 'fs';
 import * as admin from 'firebase-admin';
 import { DeviceToken, DeviceTokenDocument, DevicePlatform } from '../schemas/device-token.schema';
+import { User, UserDocument } from '../../auth/schemas/user.schema';
 import { GLOBAL_DB_CONNECTION } from '../../common/constants';
 
 /** Nombre maximal d'appareils gardés par compte (les plus anciens sont oubliés). */
@@ -42,6 +43,8 @@ export class PushService implements OnModuleInit {
     private readonly config: ConfigService,
     @InjectModel(DeviceToken.name, GLOBAL_DB_CONNECTION)
     private readonly deviceModel: Model<DeviceTokenDocument>,
+    @InjectModel(User.name, GLOBAL_DB_CONNECTION)
+    private readonly userModel: Model<UserDocument>,
   ) {}
 
   onModuleInit() {
@@ -92,7 +95,17 @@ export class PushService implements OnModuleInit {
   }
 
   /** Enregistre (ou rattache au compte courant) le jeton FCM d'un appareil. */
-  async registerDevice(userId: string, token: string, platform: DevicePlatform, appVersion?: string) {
+  async registerDevice(
+    userId: string,
+    token: string,
+    platform: DevicePlatform,
+    appVersion?: string,
+    utcOffsetMinutes?: number,
+  ) {
+    // Heure locale du voyageur : rappels de départ envoyés au bon moment
+    if (typeof utcOffsetMinutes === 'number') {
+      this.userModel.updateOne({ user_id: userId }, { $set: { utc_offset_minutes: utcOffsetMinutes } }).exec().catch(() => undefined);
+    }
     await this.deviceModel
       .updateOne(
         { token },

@@ -1,4 +1,4 @@
-import { IsIn, IsOptional, IsString, MaxLength, MinLength } from 'class-validator';
+import { IsIn, IsInt, IsOptional, IsString, Max, MaxLength, Min, MinLength } from 'class-validator';
 import { DEVICE_PLATFORMS, DevicePlatform } from '../schemas/device-token.schema';
 
 export class RegisterDeviceDto {
@@ -14,6 +14,13 @@ export class RegisterDeviceDto {
   @IsString()
   @MaxLength(40)
   app_version?: string;
+
+  /** Décalage horaire du téléphone en minutes (UTC+1 = 60) */
+  @IsOptional()
+  @IsInt()
+  @Min(-720)
+  @Max(840)
+  utc_offset_minutes?: number;
 }
 
 export class UnregisterDeviceDto {

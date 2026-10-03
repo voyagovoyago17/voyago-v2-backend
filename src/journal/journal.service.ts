@@ -8,6 +8,8 @@ import { placeKey } from '../places/place-key';
 import { JournalEntry, JournalEntryDocument, JournalEntrySchema } from './schemas/journal-entry.schema';
 import { UpsertJournalEntryDto } from './dto/upsert-entry.dto';
 import { TripScheduleService } from '../trips/trip-schedule.service';
+import { GEM_XP } from '../trips/trip-gems.service';
+import { AiService } from '../ai/ai.service';
 import { isTripPast, tripBadge, tripDistanceKm, tripEndDate } from './journal-utils';
 import { TenancyService } from '../tenancy/tenancy.service';
 import { GamificationService } from '../gamification/gamification.service';
@@ -34,6 +36,7 @@ export class JournalService {
     private readonly uploadService: UploadService,
     private readonly tripsService: TripsService,
     private readonly tripSchedule: TripScheduleService,
+    private readonly aiService: AiService,
   ) {}
 
   private tripModel(userId: string) {
@@ -208,6 +211,45 @@ export class JournalService {
     return this.toEntryDto(entry);
   }
 
+  /**
+   * « Et maintenant ? » : 3 idées de prochain voyage d'après ce que le voyageur a aimé.
+   * Générées une seule fois puis gardées avec le voyage.
+   */
+  async nextSuggestions(userId: string, tripId: string) {
+    const TripModel = await this.tripModel(userId);
+    const trip: any = await TripModel.findOne({ id: tripId, user_id: userId })
+      .select('id destination country duration_days pace budget interests pois next_suggestions')
+      .lean()
+      .exec();
+    if (!trip) throw new NotFoundException(`Voyage ${tripId} introuvable`);
+    if (trip.next_suggestions?.items?.length) return { trip_id: tripId, suggestions: trip.next_suggestions.items };
+
+    const keys = (trip.pois || []).map((p: any) => placeKey(p.name, p.lat, p.lng));
+    const reviews: any[] = await this.reviewModel.find({ user_id: userId, place_key: { $in: keys } }).lean().exec();
+    const nameByKey = new Map((trip.pois || []).map((p: any) => [placeKey(p.name, p.lat, p.lng), p.name]));
+    const loved = reviews.filter((r) => r.liked || r.rating >= 4).map((r) => nameByKey.get(r.place_key)).filter(Boolean);
+    const disliked = reviews.filter((r) => r.rating && r.rating <= 2).map((r) => nameByKey.get(r.place_key)).filter(Boolean);
+
+    const items = await this.aiService.suggestNextDestinations({
+      destination: trip.destination,
+      country: trip.country,
+      duration_days: trip.duration_days,
+      pace: trip.pace,
+      budget: trip.budget,
+      interests: trip.interests,
+      loved: loved as string[],
+      disliked: disliked as string[],
+      month: new Date().toLocaleDateString('fr-FR', { month: 'long', year: 'numeric' }),
+    });
+    if (items.length) {
+      await TripModel.updateOne(
+        { id: tripId, user_id: userId },
+        { $set: { next_suggestions: { generated_at: new Date(), items } } },
+      ).exec();
+    }
+    return { trip_id: tripId, suggestions: items };
+  }
+
   /** Termine le voyage : il quitte la carte et rejoint le journal. */
   async complete(userId: string, tripId: string) {
     return this.setCompleted(userId, tripId, new Date());
@@ -289,6 +331,7 @@ export class JournalService {
       }
       if (review || entryByPoi.get(p.name)?.visited) visited++;
     }
+    const gemsCollected = (trip.gems || []).filter((g: any) => g.collected_at);
     const stats = {
       distance_km: tripDistanceKm(pois),
       places_count: pois.length,
@@ -299,7 +342,14 @@ export class JournalService {
       hidden_gems: pois.filter((p) => p.hidden_gem).length,
       photos_count: entries.reduce((n, e) => n + (e.photos?.length || 0), 0),
       notes_count: entries.filter((e) => (e.note || '').trim().length > 0).length,
-      xp_earned: TRIP_GENERATION_XP + reviewsCount * REVIEW_XP + (trip.journal_shared_at ? SHARE_JOURNAL_XP : 0),
+      // Radar des pépites : trouvailles ramassées sur le terrain
+      gems_total: (trip.gems || []).length,
+      gems_collected: gemsCollected.length,
+      xp_earned:
+        TRIP_GENERATION_XP +
+        reviewsCount * REVIEW_XP +
+        (trip.journal_shared_at ? SHARE_JOURNAL_XP : 0) +
+        gemsCollected.reduce((sum: number, g: any) => sum + (GEM_XP[g.rarity] ?? GEM_XP.commune), 0),
     };
     return stats;
   }

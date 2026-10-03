@@ -29,6 +29,13 @@ export class JournalController {
     return this.journalService.detail(user.user_id, tripId);
   }
 
+  /** « Et maintenant ? » : 3 idées de prochain voyage d'après ce que le voyageur a aimé */
+  @ApiOperation({ summary: 'Idées de prochain voyage à partir du voyage terminé' })
+  @Get(':tripId/next')
+  async next(@CurrentUser() user: any, @Param('tripId') tripId: string) {
+    return this.journalService.nextSuggestions(user.user_id, tripId);
+  }
+
   /** Souvenir d'un lieu : note, humeurs, visité */
   @ApiOperation({ summary: 'Enregistrer une note de souvenir, ressenti ou humeur sur un lieu' })
   @Put(':tripId/entries')

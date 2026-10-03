@@ -26,6 +26,10 @@ export class TripSchedule {
   @Prop({ type: Date, default: null })
   start_date: Date | null;
 
+  /** Décalage horaire de la destination (minutes) : récap du soir à l'heure locale */
+  @Prop({ type: Number, default: null })
+  dest_utc_offset_minutes: number | null;
+
   /** Rappel « départ demain » déjà envoyé */
   @Prop({ type: Date, default: null })
   departure_notified_at: Date | null;

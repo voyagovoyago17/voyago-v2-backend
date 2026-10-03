@@ -13,6 +13,7 @@ import { GamificationModule } from '../gamification/gamification.module';
 import { NotificationsModule } from '../notifications/notifications.module';
 import { UploadModule } from '../upload/upload.module';
 import { TripsModule } from '../trips/trips.module';
+import { AiModule } from '../ai/ai.module';
 import { GLOBAL_DB_CONNECTION, TENANT_DB_CONNECTION } from '../common/constants';
 
 @Module({
@@ -31,6 +32,7 @@ import { GLOBAL_DB_CONNECTION, TENANT_DB_CONNECTION } from '../common/constants'
     NotificationsModule,
     UploadModule,
     TripsModule,
+    AiModule,
   ],
   controllers: [JournalController],
   providers: [JournalService, TripAutoCompleteService, SessionAuthGuard],

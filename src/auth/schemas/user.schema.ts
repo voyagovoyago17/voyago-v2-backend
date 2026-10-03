@@ -60,6 +60,10 @@ export class User {
   @Prop({ type: Date, default: null })
   email_verified_at: Date | null;
 
+  /** Décalage horaire du téléphone (minutes, ex. 60 = UTC+1) : rappels à l'heure locale */
+  @Prop({ type: Number, default: null })
+  utc_offset_minutes: number | null;
+
   @Prop({ default: false })
   is_pro: boolean;
 

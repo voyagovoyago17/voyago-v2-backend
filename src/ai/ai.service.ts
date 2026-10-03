@@ -129,6 +129,41 @@ export interface PackingCategoryDraft {
   items: PackingItemDraft[];
 }
 
+export interface NextDestinationDraft {
+  destination: string;
+  country: string;
+  emoji: string;
+  kind: 'meme_esprit' | 'pas_loin' | 'depaysement';
+  pitch: string;
+  best_season: string;
+  duration_days: number;
+  interests: string[];
+}
+
+const NEXT_DESTINATIONS_SCHEMA: ResponseSchema = {
+  type: SchemaType.OBJECT,
+  properties: {
+    suggestions: {
+      type: SchemaType.ARRAY,
+      items: {
+        type: SchemaType.OBJECT,
+        properties: {
+          destination: { type: SchemaType.STRING },
+          country: { type: SchemaType.STRING },
+          emoji: { type: SchemaType.STRING },
+          kind: { type: SchemaType.STRING, format: 'enum', enum: ['meme_esprit', 'pas_loin', 'depaysement'] },
+          pitch: { type: SchemaType.STRING },
+          best_season: { type: SchemaType.STRING },
+          duration_days: { type: SchemaType.INTEGER },
+          interests: { type: SchemaType.ARRAY, items: { type: SchemaType.STRING } },
+        },
+        required: ['destination', 'country', 'emoji', 'kind', 'pitch', 'duration_days'],
+      },
+    },
+  },
+  required: ['suggestions'],
+};
+
 const PACKING_RESPONSE_SCHEMA: ResponseSchema = {
   type: SchemaType.OBJECT,
   properties: {
@@ -561,6 +596,86 @@ Réponds avec UNIQUEMENT un objet JSON : {"categories":[{"key":"documents","titl
         { label: 'Gourde réutilisable', essential: false },
       ] },
     ];
+  }
+
+  /**
+   * « Et maintenant ? » : 3 idées de prochain voyage à partir de ce que le voyageur a aimé
+   * (lieux notés, intérêts, rythme, budget). Une même veine, une proche, un dépaysement.
+   */
+  async suggestNextDestinations(input: {
+    destination: string;
+    country?: string;
+    duration_days: number;
+    pace?: string;
+    budget?: string;
+    interests?: string[];
+    loved: string[];
+    disliked: string[];
+    month: string;
+  }): Promise<NextDestinationDraft[]> {
+    const prompt = `Tu es Voyago, conseiller voyage enthousiaste et précis. Un voyageur rentre de ${input.destination}${input.country ? ` (${input.country})` : ''} (${input.duration_days} jours, rythme ${input.pace || 'equilibre'}, budget ${input.budget || 'moyen'}).
+Ses centres d'intérêt : ${(input.interests || []).join(', ') || 'découverte'}.
+Lieux qu'il a adorés : ${input.loved.slice(0, 8).join(', ') || 'non précisé'}.
+Lieux moins appréciés : ${input.disliked.slice(0, 5).join(', ') || 'aucun'}.
+Nous sommes en ${input.month}.
+
+Propose exactement 3 prochains voyages, chacun d'un "kind" différent :
+- "meme_esprit" : même ambiance que ce qu'il a adoré, dans un autre pays ;
+- "pas_loin" : accessible facilement depuis la région de ${input.country || input.destination}, budget maîtrisé ;
+- "depaysement" : une vraie découverte, cohérente avec ses intérêts.
+Règles : jamais ${input.destination} ; destinations réelles et sûres ; "destination" = ville ou région précise ; "pitch" = 1 phrase en français (18 mots max) qui relie au voyage qu'il vient de faire ; "best_season" = meilleure période (ex : "avril à juin") ; "duration_days" entre 3 et 10 ; "interests" = 2 à 4 mots-clés en français ; "emoji" = 1 emoji évocateur.
+
+Réponds avec UNIQUEMENT un objet JSON : {"suggestions":[{"destination":"...","country":"...","emoji":"...","kind":"meme_esprit","pitch":"...","best_season":"...","duration_days":5,"interests":["..."]}]}`;
+
+    const parse = (text: string): NextDestinationDraft[] => {
+      const raw = JSON.parse(text.replace(/```json/g, '').replace(/```/g, '').trim())?.suggestions;
+      if (!Array.isArray(raw)) return [];
+      const seen = new Set<string>();
+      return raw
+        .filter((r: any) => typeof r?.destination === 'string' && r.destination.trim())
+        .filter((r: any) => r.destination.trim().toLowerCase() !== input.destination.trim().toLowerCase())
+        .filter((r: any) => !seen.has(r.destination.toLowerCase()) && seen.add(r.destination.toLowerCase()))
+        .slice(0, 3)
+        .map((r: any) => ({
+          destination: r.destination.trim().slice(0, 60),
+          country: String(r.country || '').trim().slice(0, 60),
+          emoji: String(r.emoji || '🌍').slice(0, 4),
+          kind: ['meme_esprit', 'pas_loin', 'depaysement'].includes(r.kind) ? r.kind : 'depaysement',
+          pitch: String(r.pitch || '').trim().slice(0, 160),
+          best_season: String(r.best_season || '').trim().slice(0, 40),
+          duration_days: Math.min(10, Math.max(3, Number(r.duration_days) || 5)),
+          interests: Array.isArray(r.interests) ? r.interests.map(String).slice(0, 4) : [],
+        }));
+    };
+
+    if (this.genAI) {
+      for (const modelName of ['gemini-3.5-flash-lite', 'gemini-flash-lite-latest', 'gemini-flash-latest']) {
+        try {
+          const model = this.genAI.getGenerativeModel({
+            model: modelName,
+            generationConfig: { responseMimeType: 'application/json', responseSchema: NEXT_DESTINATIONS_SCHEMA, temperature: 0.8 },
+          });
+          const list = parse((await model.generateContent(prompt)).response.text());
+          if (list.length) return list;
+        } catch (err: any) {
+          this.logger.warn(`Next destinations with ${modelName} failed: ${err.message}`);
+        }
+      }
+    }
+    if (this.anthropic) {
+      try {
+        const message = await this.anthropic.messages.create({
+          model: 'claude-haiku-4-5',
+          max_tokens: 1200,
+          messages: [{ role: 'user', content: prompt }],
+        });
+        const textBlock = message.content.find((b): b is Anthropic.TextBlock => b.type === 'text');
+        if (textBlock) return parse(textBlock.text);
+      } catch (err: any) {
+        this.logger.warn(`Next destinations with Claude failed: ${err.message}`);
+      }
+    }
+    return [];
   }
 
   /** Les pépites ne sont demandées que pour un voyage classique (pas pour un vote de tribu). */
@@ -1444,6 +1559,21 @@ Réponds STRICTEMENT en JSON :
     } catch (_) {}
 
     return fallbackUrl || this.getCuratedPhoto('culture', imageQuery);
+  }
+
+  /** Décalage horaire (minutes) d'un lieu, via Open-Meteo ; repli sur la longitude. */
+  async fetchUtcOffsetMinutes(lat: number, lng: number): Promise<number> {
+    try {
+      const response = await axios.get('https://api.open-meteo.com/v1/forecast', {
+        params: { latitude: lat, longitude: lng, timezone: 'auto', forecast_days: 1, daily: 'weathercode' },
+        timeout: 4000,
+      });
+      const seconds = response.data?.utc_offset_seconds;
+      if (typeof seconds === 'number') return Math.round(seconds / 60);
+    } catch {
+      // Repli ci-dessous
+    }
+    return Math.round(lng / 15) * 60;
   }
 
   async fetchWeather(lat: number, lng: number, durationDays: number, startDate?: string): Promise<DayWeather[]> {
