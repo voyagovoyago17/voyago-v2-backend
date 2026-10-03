@@ -447,6 +447,8 @@ Réponds avec UNIQUEMENT un objet JSON compact : {"gems":[{"name":"...","teaser"
    */
   async generatePackingList(trip: {
     destination: string;
+    traveler?: { gender?: string | null; age?: number | null };
+    travelers?: { party: string; adults: number; children_ages: number[] } | null;
     country?: string;
     duration_days: number;
     start_date?: string;
@@ -473,18 +475,35 @@ Réponds avec UNIQUEMENT un objet JSON compact : {"gems":[{"name":"...","teaser"
       ? `Départ le ${new Date(trip.start_date).toLocaleDateString('fr-FR', { day: 'numeric', month: 'long', year: 'numeric' })}.`
       : 'Dates non précisées.';
     const categories = [...new Set((trip.pois || []).map((p: any) => p.category).filter(Boolean))].slice(0, 12).join(', ');
+    // Profil : affaires propres à chacun (règles, rasage, enfants...) sans rien supposer d'autre
+    const gender = trip.traveler?.gender;
+    const profile =
+      gender === 'female'
+        ? 'Titulaire du compte : une femme'
+        : gender === 'male'
+          ? 'Titulaire du compte : un homme'
+          : 'Titulaire du compte : genre non précisé (liste neutre)';
+    const age = trip.traveler?.age ? `, ${trip.traveler.age} ans` : '';
+    const party = trip.travelers;
+    const kids = party?.children_ages || [];
+    const group = party
+      ? ` · Groupe : ${party.party}, ${party.adults} adulte(s)${kids.length ? `, enfants de ${kids.join(', ')} ans` : ''}`
+      : '';
 
     const prompt = `Tu es Voyago, expert en préparation de voyage. Prépare la valise idéale, ni trop ni trop peu.
 Voyage : ${trip.destination}${trip.country ? ` (${trip.country})` : ''}, ${days} jour(s). ${when}
 ${climate}
 Rythme : ${trip.pace || 'equilibre'} · Budget : ${trip.budget || 'moyen'} · Transports : ${(trip.transports || []).join(', ') || 'marche'}
 Centres d'intérêt : ${(trip.interests || []).join(', ') || 'découverte'}${categories ? ` · Lieux prévus : ${categories}` : ''}
+${profile}${age}${group}
 
 Règles :
 - 25 à 40 objets au total, en français, concrets et adaptés à CE voyage (quantités selon la durée : "5 t-shirts légers", pas "des t-shirts").
 - Couvre la brosse à dents jusqu'aux vêtements : documents (passeport/CNI, visa ou e-visa si probable, assurance, billets), argent (devise locale, carte sans frais), vêtements, chaussures, hygiène, santé (trousse, médicaments utiles au pays, répulsif si zone à moustiques), électronique (adaptateur de prise du pays, batterie externe), météo (selon les températures et la pluie), activités (selon les intérêts et lieux), divers.
 - "essential" = true seulement pour l'indispensable (8 à 12 objets).
 - "reason" : pourquoi pour CE voyage, 8 mots max (ex : "Prises de type C au Togo").
+- Personnalise selon le profil : pour une femme, ajoute en hygiène/santé les protections périodiques (serviettes, tampons, culottes ou coupe menstruelle, en quantité pour la durée) et leurs indispensables, sans jugement ni texte gênant ; pour un homme, le nécessaire de rasage ; si le genre n'est pas précisé, reste neutre.
+- Groupe : prévois les quantités pour tous ; avec des enfants, ajoute une catégorie adaptée à leur âge (doudou, couches et lingettes pour les bébés, jeux et livres pour la route, gourde, chapeau et crème solaire enfant, médicaments pédiatriques, pièces d'identité des mineurs et autorisation de sortie si besoin "à vérifier").
 - N'invente pas d'obligation administrative : écris "à vérifier" en cas de doute.
 - "key" parmi : ${PACKING_CATEGORIES.join(', ')} ; "title" = titre court avec la bonne casse (ex : "Documents").
 
@@ -523,7 +542,24 @@ Réponds avec UNIQUEMENT un objet JSON : {"categories":[{"key":"documents","titl
         this.logger.warn(`Packing list with Claude failed: ${err.message}`);
       }
     }
-    return this.defaultPackingList(days, minT, maxT, rainy > 0);
+    const base = this.defaultPackingList(days, minT, maxT, rainy > 0);
+    const hygiene = base.find((c) => c.key === 'hygiene');
+    if (gender === 'female' && hygiene) {
+      hygiene.items.push({ label: 'Protections périodiques (pour la durée du voyage)', essential: true, reason: 'Pas toujours faciles à trouver sur place' });
+    }
+    if (kids.length) {
+      base.push({
+        key: 'divers',
+        title: 'Enfants',
+        items: [
+          { label: 'Doudou et jeux pour la route', essential: true },
+          { label: 'Médicaments pédiatriques et carnet de santé', essential: true },
+          { label: "Pièces d'identité des enfants", essential: true, reason: 'Autorisation de sortie : à vérifier' },
+          ...(kids.some((a) => a <= 3) ? [{ label: 'Couches et lingettes', essential: true }] : []),
+        ],
+      });
+    }
+    return base;
   }
 
   private sanitizePacking(raw: any): PackingCategoryDraft[] {
@@ -804,6 +840,56 @@ Réponds avec UNIQUEMENT un objet JSON : {"suggestions":[{"destination":"...","c
     return dto.pace === 'tranquille' ? 3 : dto.pace === 'intensif' ? 5 : 4;
   }
 
+  /** Budget chiffré : enveloppe par jour et par personne, adresses et activités qui la respectent. */
+  private budgetContext(dto: GenerateTripDto): string {
+    if (!dto.budget_amount || dto.budget_amount <= 0) return '';
+    const people = Math.max(1, (dto.adults ?? 1) + (dto.children_ages?.length ?? 0));
+    const perDay = Math.round(dto.budget_amount / Math.max(1, dto.duration_days));
+    const perPersonDay = Math.round(perDay / people);
+    const currency = dto.currency || 'EUR';
+    return `
+- Enveloppe annoncée : ${dto.budget_amount} ${currency} pour tout le voyage (≈ ${perDay} ${currency}/jour, ≈ ${perPersonDay} ${currency}/jour/personne, hors transport aller-retour). Choisis restaurants et activités qui tiennent dans cette enveloppe ; privilégie les lieux gratuits ou peu chers si elle est serrée, et indique dans "insider_tip" un ordre de prix quand il est utile (entrée, plat).`;
+  }
+
+  /** Composition du groupe : lieux, rythme et activités pour que chacun en profite. */
+  private travelersContext(dto: GenerateTripDto): string {
+    if (!dto.travel_party || dto.purpose === 'tribe_vote') return '';
+    const adults = dto.adults ?? (dto.travel_party === 'solo' ? 1 : 2);
+    const kids = (dto.children_ages || []).slice().sort((a, b) => a - b);
+    const kidsLabel = kids.length
+      ? `${kids.length} enfant${kids.length > 1 ? 's' : ''} (${kids.map((a) => (a < 1 ? 'bébé' : `${a} ans`)).join(', ')})`
+      : '';
+    const who =
+      dto.travel_party === 'solo'
+        ? 'voyage en solo'
+        : dto.travel_party === 'couple'
+          ? 'voyage en couple'
+          : dto.travel_party === 'amis'
+            ? `voyage entre amis (${adults} personnes)`
+            : `voyage en famille : ${adults} adulte${adults > 1 ? 's' : ''}${kidsLabel ? ` et ${kidsLabel}` : ''}`;
+
+    const rules: string[] = [];
+    if (kids.length) {
+      const youngest = kids[0];
+      rules.push(
+        'Chaque journée contient au moins 1 lieu pensé pour les enfants (parc, plage surveillée, aquarium, musée interactif, ferme, atelier, aire de jeux) ; les autres restent agréables pour eux.',
+        'Visites plus courtes, trajets limités, pauses régulières ; pas de bar de nuit ni de lieu interdit aux mineurs.',
+        "\"insider_tip\" donne une astuce famille quand c'est utile (jeu ou défi à faire sur place pour les enfants, tarif enfant, espace bébé, accès poussette).",
+      );
+      if (youngest <= 3) rules.push('Avec un tout-petit : lieux accessibles en poussette, fin de journée avant 18h, une pause sieste en début d\'après-midi.');
+      if (kids.some((a) => a >= 12)) rules.push('Pour les ados : au moins une activité un peu sportive ou ludique (escalade, kayak, escape game, street-art).');
+    } else if (dto.travel_party === 'couple') {
+      rules.push('Ajoute des moments à deux : coucher de soleil, table intimiste, balade romantique.');
+    } else if (dto.travel_party === 'amis') {
+      rules.push('Privilégie les expériences à vivre en groupe : tables à partager, activités, vie nocturne si les intérêts s\'y prêtent.');
+    } else if (dto.travel_party === 'solo') {
+      rules.push('Privilégie des lieux conviviaux et sûrs pour un voyageur seul, faciles à rejoindre.');
+    }
+    return `
+- Voyageurs : ${who}. Les centres d'intérêt restent ceux du titulaire du compte ; adapte-les pour que tout le groupe en profite.
+${rules.map((r) => `  • ${r}`).join('\n')}`;
+  }
+
   private expectedPoiCount(dto: GenerateTripDto): number {
     return dto.duration_days * this.activitiesPerDay(dto);
   }
@@ -872,6 +958,7 @@ Réponds avec UNIQUEMENT un objet JSON : {"suggestions":[{"destination":"...","c
       ? '4 km (15-20 min à vélo maximum entre deux étapes)'
       : '1,5 km (15-20 min à pied maximum entre deux étapes)';
     const dayEnd = activitiesPerDay === 5 ? '21h' : '19h';
+    const travelersContext = this.travelersContext(dto);
     // Voyage de tribu : les lieux sont présentés un par un au vote du groupe (swipe)
     const tribeContext =
       dto.purpose === 'tribe_vote'
@@ -910,8 +997,8 @@ Conçois un itinéraire authentique, géographiquement optimisé et mémorable.
 - Centres d'intérêt prioritaires : ${interests}
 - Rythme : ${paceDetails}
 - Déplacements : ${transports}
-- Budget : ${dto.budget} (adapte le standing des adresses)
-- Sensibilité thermique : ${this.getThermalSensitivityNote(dto.thermal_sensitivity)}${tribeContext}${gemsSection}
+- Budget : ${dto.budget} (adapte le standing des adresses)${this.budgetContext(dto)}
+- Sensibilité thermique : ${this.getThermalSensitivityNote(dto.thermal_sensitivity)}${travelersContext}${tribeContext}${gemsSection}
 
 ## RÈGLES
 1. VOLUME : exactement ${activitiesPerDay} lieux par jour, soit ${totalPoisCount} au total. Créneaux "order" : ${orderSlots}. Le lieu order 2 est un restaurant ou une adresse gourmande.

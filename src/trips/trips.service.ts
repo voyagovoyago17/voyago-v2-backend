@@ -506,6 +506,11 @@ export class TripsService {
       pace: dto.pace,
       transports: dto.transports,
       budget: dto.budget,
+      budget_amount: dto.budget_amount ?? null,
+      currency: dto.budget_amount ? dto.currency || 'EUR' : null,
+      travelers: dto.travel_party
+        ? { party: dto.travel_party, adults: dto.adults ?? 1, children_ages: dto.children_ages ?? [] }
+        : null,
       interests: dto.interests,
       pois: poisWithImages,
       weather,

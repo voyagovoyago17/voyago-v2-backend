@@ -4,6 +4,11 @@ import { TenancyService } from '../tenancy/tenancy.service';
 import { AiService, PACKING_CATEGORIES } from '../ai/ai.service';
 import { GamificationService } from '../gamification/gamification.service';
 import { TripDocument, TripSchema } from './schemas/trip.schema';
+import { InjectModel } from '@nestjs/mongoose';
+import { Model } from 'mongoose';
+import { User, UserDocument } from '../auth/schemas/user.schema';
+import { GLOBAL_DB_CONNECTION } from '../common/constants';
+import { ageFrom } from '../community/circle-access.service';
 
 /**
  * Valise du voyage : liste sur mesure générée une fois par l'IA (climat, durée, activités),
@@ -19,6 +24,7 @@ export class TripPackingService {
     private readonly tenancyService: TenancyService,
     private readonly aiService: AiService,
     private readonly gamificationService: GamificationService,
+    @InjectModel(User.name, GLOBAL_DB_CONNECTION) private readonly userModel: Model<UserDocument>,
   ) {}
 
   private tripModel(userId: string) {
@@ -48,7 +54,7 @@ export class TripPackingService {
   async get(userId: string, tripId: string) {
     const TripModel = await this.tripModel(userId);
     const trip: any = await TripModel.findOne({ id: tripId, user_id: userId })
-      .select('id destination country duration_days start_date pace budget transports interests weather pois packing_list')
+      .select('id destination country duration_days start_date pace budget transports interests weather pois travelers packing_list')
       .lean()
       .exec();
     if (!trip) throw new NotFoundException(`Trip ${tripId} not found`);
@@ -65,7 +71,11 @@ export class TripPackingService {
   }
 
   private async generate(userId: string, trip: any) {
-    const drafts = await this.aiService.generatePackingList(trip);
+    const user: any = await this.userModel.findOne({ user_id: userId }).select('gender date_of_birth').lean().exec();
+    const drafts = await this.aiService.generatePackingList({
+      ...trip,
+      traveler: { gender: user?.gender ?? null, age: ageFrom(user?.date_of_birth) },
+    });
     const list = {
       generated_at: new Date(),
       categories: drafts.map((c) => ({

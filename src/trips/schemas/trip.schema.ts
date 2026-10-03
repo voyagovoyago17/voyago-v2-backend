@@ -128,6 +128,17 @@ export class Trip {
   @Prop({ type: Date, default: null })
   completed_at?: Date | null;
 
+  /** Budget annoncé (facultatif) et devise */
+  @Prop({ type: Number, default: null })
+  budget_amount?: number | null;
+
+  @Prop({ type: String, default: null })
+  currency?: string | null;
+
+  /** Qui part : composition du groupe (adultes, âges des enfants) */
+  @Prop({ type: Object, default: null })
+  travelers?: { party: string; adults: number; children_ages: number[] } | null;
+
   /** « Et maintenant ? » : idées de prochain voyage (générées une fois, à la fin du voyage) */
   @Prop({ type: Object, default: null })
   next_suggestions?: Record<string, any> | null;
