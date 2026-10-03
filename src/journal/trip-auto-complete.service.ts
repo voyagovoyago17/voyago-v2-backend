@@ -8,6 +8,7 @@ import { Model } from 'mongoose';
 import { Trip } from '../trips/schemas/trip.schema';
 import { GLOBAL_DB_CONNECTION, TENANT_DB_CONNECTION } from '../common/constants';
 import { User, UserDocument } from '../auth/schemas/user.schema';
+import { computeBudgetSummary } from '../trips/budget-summary';
 
 /** Heure « murale » locale : un Date dont les champs UTC donnent l'heure locale. */
 function localClock(offsetMinutes: number, at = Date.now()): Date {
@@ -191,10 +192,20 @@ export class TripAutoCompleteService implements OnModuleInit, OnModuleDestroy {
 
     const recent = now.getTime() - new Date(entry.end_date).getTime() <= NOTIFY_WITHIN_MS;
     if (recent) {
+      // Réservations & Budget part au journal avec le voyage : on en donne le bilan
+      const trip: any = await TripModel.findOne({ id: entry.trip_id }).select('budget budget_amount currency duration_days travelers bookings').lean().exec();
+      const budget = trip ? computeBudgetSummary(trip) : null;
+      const money = (v: number) => `${v} ${budget?.currency === 'EUR' ? '€' : budget?.currency}`;
+      const budgetLine =
+        budget && budget.bookings.length
+          ? budget.spent <= budget.total
+            ? ` Budget tenu : ${money(budget.spent)} dépensés sur ${money(budget.total)} 💪`
+            : ` Budget : ${money(budget.spent)} dépensés pour ${money(budget.total)} prévus.`
+          : '';
       this.notificationsService.notifySafely(entry.user_id, {
         type: 'system',
         title: `🎉 Bon retour ! Ton voyage à ${entry.destination} est terminé`,
-        body: 'Ton bilan de voyage est prêt : lieux, pépites, photos, ta story à partager… et 3 idées pour la suite ✨',
+        body: `Ton bilan de voyage est prêt : lieux, pépites, photos, budget et 3 idées pour la suite ✨${budgetLine}`,
         data: { trip_id: entry.trip_id, journal: true, auto_completed: true },
         dedupe_key: `journal_ready:${entry.trip_id}`,
       });

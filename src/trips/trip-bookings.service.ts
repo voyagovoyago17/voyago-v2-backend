@@ -9,6 +9,8 @@ import { User, UserDocument } from '../auth/schemas/user.schema';
 import { GLOBAL_DB_CONNECTION } from '../common/constants';
 import { TripDocument, TripSchema } from './schemas/trip.schema';
 import { distanceMeters } from './trip-gems.service';
+import { DAILY_BUDGET_BY_LEVEL, SPLIT_BY_LEVEL, computeBudgetSummary } from './budget-summary';
+import { isTripPast } from '../journal/journal-utils';
 import { TravelpayoutsService } from './travelpayouts.service';
 import { PriceAlertService } from './price-alert.service';
 import { DestinationCatalogService, catalogNorm } from '../catalog/destination-catalog.service';
@@ -21,16 +23,6 @@ import {
   lodgingChoices,
   transferChoices,
 } from './partner-links';
-
-/** Budget par personne et par jour quand le voyageur n'a pas annoncé de montant (EUR) */
-const DAILY_BUDGET_BY_LEVEL: Record<string, number> = { economique: 70, moyen: 140, luxe: 320 };
-
-/** Répartition du budget selon le standing (hébergement, transports, activités, repas & extras) */
-const SPLIT_BY_LEVEL: Record<string, { lodging: number; transport: number; activities: number; meals: number }> = {
-  economique: { lodging: 0.38, transport: 0.17, activities: 0.15, meals: 0.3 },
-  moyen: { lodging: 0.45, transport: 0.15, activities: 0.15, meals: 0.25 },
-  luxe: { lodging: 0.52, transport: 0.13, activities: 0.15, meals: 0.2 },
-};
 
 /** Échec ou résultat partiel de l'IA : pas de nouvel essai automatique pendant 10 min */
 const RECENT_TTL_MS = 10 * 60_000;
@@ -71,7 +63,7 @@ export class TripBookingsService {
     const TripModel = await this.tripModel(userId);
     const trip: any = await TripModel.findOne({ id: tripId, user_id: userId })
       .select(
-        'id destination city country country_code duration_days start_date budget budget_amount currency travelers transports pois weather bookings_plan bookings cover_image_url',
+        'id destination city country country_code duration_days start_date end_date completed_at budget budget_amount currency travelers transports pois weather bookings_plan bookings cover_image_url',
       )
       .lean()
       .exec();
@@ -89,6 +81,8 @@ export class TripBookingsService {
    */
   async get(userId: string, tripId: string, opts: { wait?: number; retry?: boolean } = {}) {
     const trip = await this.loadTrip(userId, tripId);
+    // Voyage terminé : son budget est rangé dans le journal (bilan figé, sans IA ni recherche de prix)
+    if (isTripPast(trip)) return this.archived(trip);
     const user: any = await this.userModel.findOne({ user_id: userId }).select('city country').lean().exec();
     const choiceLists: PartnerChoice[][] = [];
 
@@ -452,6 +446,45 @@ export class TripBookingsService {
       estimates_available: !!estimates,
       /** ready | pending (calcul en cours, l'app rafraîchit) | failed (bouton Réessayer) */
       estimates_status: estimated.status,
+    };
+  }
+
+  /** Bilan d'un voyage terminé : budget, dépenses et réservations, en lecture (le journal le reprend) */
+  private archived(trip: any) {
+    const summary = computeBudgetSummary(trip);
+    const adults = Math.max(1, trip.travelers?.adults ?? 1);
+    const days = Math.max(1, trip.duration_days || 1);
+    return {
+      archived: true,
+      trip_id: trip.id,
+      destination: trip.city || trip.destination,
+      cover_image_url: trip.cover_image_url || null,
+      currency: summary.currency,
+      level: summary.level,
+      announced_budget: summary.announced_budget,
+      dates_known: !!trip.start_date,
+      travelers: { adults, children_ages: trip.travelers?.children_ages ?? [], party: trip.travelers?.party || null },
+      days,
+      nights: Math.max(0, days - 1),
+      budget: {
+        total: summary.total,
+        allocation: summary.allocation,
+        spent: summary.spent,
+        spent_by: summary.spent_by,
+        flights_spent: summary.flights_spent,
+        available: summary.available,
+        estimated_needs: { lodging: 0, activities: 0, meals: 0 },
+      },
+      stays: [],
+      daily: [],
+      transport: [],
+      activities: [],
+      pass_compare: null,
+      plan: null,
+      price_alert: null,
+      bookings: summary.bookings,
+      estimates_available: true,
+      estimates_status: 'ready',
     };
   }
 

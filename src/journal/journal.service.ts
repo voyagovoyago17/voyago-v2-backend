@@ -17,6 +17,7 @@ import { NotificationsService } from '../notifications/notifications.service';
 import { UploadService } from '../upload/upload.service';
 import { TripsService } from '../trips/trips.service';
 import { GLOBAL_DB_CONNECTION, TENANT_DB_CONNECTION } from '../common/constants';
+import { computeBudgetSummary } from '../trips/budget-summary';
 
 const MAX_PHOTOS_PER_ENTRY = 6;
 const TRIP_GENERATION_XP = 3;
@@ -79,6 +80,7 @@ export class JournalService {
         journal_shared: !!trip.journal_shared_at,
         badge: tripBadge(trip, stats),
         stats,
+        budget: this.budgetBrief(trip),
       };
     });
 
@@ -144,8 +146,17 @@ export class JournalService {
       journal_shared: !!trip.journal_shared_at,
       badge: tripBadge(trip, stats),
       stats,
+      // Réservations & Budget, archivé avec le voyage
+      budget: computeBudgetSummary(trip),
       days,
     };
+  }
+
+  /** Budget en bref pour la liste du journal (null si rien n'a été suivi) */
+  private budgetBrief(trip: any) {
+    const b = computeBudgetSummary(trip);
+    if (!b.has_data) return null;
+    return { currency: b.currency, total: b.total, spent: b.spent, flights_spent: b.flights_spent, announced_budget: b.announced_budget };
   }
 
   /** Écrit (ou complète) le souvenir d'un lieu : note, humeurs, visité. */
