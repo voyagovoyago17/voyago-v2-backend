@@ -586,9 +586,11 @@ export class CommunityService {
     const memberMap = new Map(memberUsers.map((u) => [u.user_id, u]));
 
     const access = await this.circleAccess.accessInfo(circle, viewerId, realMembersCount);
-    const pendingRequests = canManageInvites
+    // Demandes en attente : les membres peuvent parrainer, les gestionnaires décider
+    const pendingRequests = viewerMembership
       ? (await this.circleAccess.pendingCounts([circle.id])).get(circle.id) || 0
       : 0;
+    const trialUntil = this.circleAccess.trialUntil(circle, viewerMembership);
 
     return {
       ...this.withoutInviteCode(circle),
@@ -596,6 +598,7 @@ export class CommunityService {
       is_locked: false,
       listed: circle.listed !== false,
       pending_requests_count: pendingRequests,
+      my_trial_until: trialUntil,
       // Code d'invitation réservé au créateur et aux admins du cercle privé
       invite_code: canManageInvites && !circle.is_public ? circle.invite_code || null : null,
       members_count: realMembersCount,
@@ -708,6 +711,7 @@ export class CommunityService {
       ...(isPublic ? {} : { invite_code: await this.generateInviteCode() }),
       tags: dto.tags || [],
       listed: dto.listed !== false,
+      trial_days: 0,
       join_rules: Object.fromEntries(
         Object.entries(dto.join_rules || {}).filter(([, v]) => v !== null && v !== undefined && v !== false && v !== 0),
       ),
@@ -747,13 +751,17 @@ export class CommunityService {
   /** Rejoindre un cercle (privé ou public) grâce à son code d'invitation. */
   async joinCircleByCode(userId: string, code: string): Promise<object> {
     const normalized = code.trim().toUpperCase();
-    const circle = normalized ? await this.circleModel.findOne({ invite_code: normalized }).exec() : null;
+    let circle = normalized ? await this.circleModel.findOne({ invite_code: normalized }).exec() : null;
+    // Sinon : code à usage limité (durée / nombre d'utilisations)
+    const limited = !circle && normalized ? await this.circleAccess.resolveInvite(normalized) : null;
+    if (limited) circle = limited.circle;
     if (!circle) {
       throw new NotFoundException("Code d'invitation invalide");
     }
     // Le code dispense de la demande, pas des conditions d'accès du cercle
     if (!(await this.memberModel.exists({ circle_id: circle.id, user_id: userId }))) {
       await this.circleAccess.assertCanJoin(circle, userId);
+      if (limited) await this.circleAccess.consumeInvite(limited.invite);
     }
     const joined = await this.addMember(userId, circle);
     await this.circleAccess.resolvePendingOnJoin(circle.id, userId);
@@ -907,6 +915,7 @@ export class CommunityService {
       throw new NotFoundException(`Cercle ${circleId} introuvable`);
     }
     await this.assertCircleAccess(circle, userId);
+    await this.circleAccess.assertCanContribute(circle.id, userId);
 
     const postId = crypto.randomUUID();
     const postData = {
@@ -959,6 +968,7 @@ export class CommunityService {
       throw new NotFoundException(`Cercle ${circleId} introuvable`);
     }
     await this.assertCircleAccess(circle, userId);
+    await this.circleAccess.assertCanContribute(circle.id, userId);
 
     // On ne partage que ses propres voyages
     const TripModel = await this.tenancyService.getTenantModel<any>(userId, 'Trip', TripSchema);

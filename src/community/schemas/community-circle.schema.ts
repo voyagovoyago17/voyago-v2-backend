@@ -15,6 +15,8 @@ export interface CircleJoinRules {
   verified_email?: boolean;
   /** Nombre maximum de membres (places limitées) */
   max_members?: number;
+  /** Pays autorisés (pays du profil du voyageur) */
+  countries?: string[];
 }
 
 @Schema({ timestamps: { createdAt: 'created_at', updatedAt: 'updated_at' } })
@@ -82,6 +84,10 @@ export class CommunityCircle {
   /** Demande acceptée automatiquement quand toutes les conditions sont remplies */
   @Prop({ default: false })
   auto_approve: boolean;
+
+  /** Période d'essai : un nouveau membre lit sans publier pendant N jours (0 = aucune) */
+  @Prop({ default: 0 })
+  trial_days: number;
 
   /** Question posée aux voyageurs qui demandent à rejoindre (facultative) */
   @Prop({ default: '' })

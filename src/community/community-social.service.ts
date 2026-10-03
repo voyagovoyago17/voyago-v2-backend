@@ -5,6 +5,7 @@ import * as crypto from 'crypto';
 import { Trip, TripDocument } from '../trips/schemas/trip.schema';
 import { User, UserDocument } from '../auth/schemas/user.schema';
 import { canViewTrip } from '../trips/trip-visibility';
+import { CircleAccessService } from './circle-access.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { GLOBAL_DB_CONNECTION, TENANT_DB_CONNECTION } from '../common/constants';
 import { CommunityService } from './community.service';
@@ -50,6 +51,7 @@ export class CommunitySocialService {
     private readonly communityService: CommunityService,
     private readonly notificationsService: NotificationsService,
     private readonly gamificationService: GamificationService,
+    private readonly circleAccess: CircleAccessService,
   ) {}
 
   // =========================================================================
@@ -161,6 +163,7 @@ export class CommunitySocialService {
 
   async addComment(userId: string, dto: CreateCommentDto) {
     const target = await this.resolveTarget(dto.target_type, dto.target_id, userId);
+    if (target.circleId) await this.circleAccess.assertCanContribute(target.circleId, userId);
     const content = dto.content.trim();
     if (!content) {
       throw new BadRequestException('Commentaire vide');

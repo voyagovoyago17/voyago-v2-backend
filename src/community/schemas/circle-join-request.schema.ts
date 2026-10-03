@@ -25,6 +25,14 @@ export class CircleJoinRequest {
   @Prop({ default: '' })
   message: string;
 
+  /** Membres qui se portent garants du voyageur (parrainage) */
+  @Prop({ type: [{ user_id: String, at: Date }], default: [] })
+  vouched_by: { user_id: string; at: Date }[];
+
+  /** Réponse du fondateur en moins de 24 h (badge « Fondateur actif ») */
+  @Prop({ default: false })
+  quick_decision: boolean;
+
   @Prop({ type: String, default: null })
   decided_by: string | null;
 
@@ -38,6 +46,7 @@ export class CircleJoinRequest {
 export const CircleJoinRequestSchema = SchemaFactory.createForClass(CircleJoinRequest);
 
 CircleJoinRequestSchema.index({ circle_id: 1, status: 1, created_at: -1 });
+CircleJoinRequestSchema.index({ decided_by: 1, quick_decision: 1 });
 // Une seule demande en attente par voyageur et par cercle
 CircleJoinRequestSchema.index(
   { circle_id: 1, user_id: 1 },

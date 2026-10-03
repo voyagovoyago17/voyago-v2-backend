@@ -9,14 +9,30 @@ import { isProActive } from '../pro/pro-status';
 import { CircleJoinRules, CommunityCircle, CommunityCircleDocument } from './schemas/community-circle.schema';
 import { CommunityMember, CommunityMemberDocument } from './schemas/community-member.schema';
 import { CircleJoinRequest, CircleJoinRequestDocument } from './schemas/circle-join-request.schema';
+import { CircleInvite, CircleInviteDocument } from './schemas/circle-invite.schema';
 import { UserBlock, UserBlockDocument } from './schemas/user-block.schema';
 import { isBlockedBetween } from './blocks';
-import { UpdateCircleAccessDto } from './dto/circle-access.dto';
+import { CreateInviteDto, UpdateCircleAccessDto } from './dto/circle-access.dto';
 import { GLOBAL_DB_CONNECTION, TENANT_DB_CONNECTION } from '../common/constants';
 
 /** Délai avant de pouvoir redemander après un refus */
 const RETRY_AFTER_REJECTION_DAYS = 7;
 const MANAGER_ROLES = ['creator', 'admin'];
+/** Réponse « rapide » du fondateur à une demande (XP + badge Fondateur actif) */
+const QUICK_DECISION_MS = 24 * 3600 * 1000;
+const ACTIVE_FOUNDER_QUICK_DECISIONS = 5;
+// Sans caractères ambigus (0/O, 1/I/L), comme les codes permanents
+const INVITE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+
+/** Comparaison de pays sans accents ni casse (« Sénégal » = « senegal »). */
+export function normalizeCountry(value?: string | null): string {
+  return (value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[’‘`´]/g, "'")
+    .trim()
+    .toLowerCase();
+}
 
 export interface RuleCheck {
   key: keyof CircleJoinRules;
@@ -51,6 +67,7 @@ export class CircleAccessService {
     @InjectModel(CircleJoinRequest.name, TENANT_DB_CONNECTION)
     private readonly requestModel: Model<CircleJoinRequestDocument>,
     @InjectModel(UserBlock.name, TENANT_DB_CONNECTION) private readonly blockModel: Model<UserBlockDocument>,
+    @InjectModel(CircleInvite.name, TENANT_DB_CONNECTION) private readonly inviteModel: Model<CircleInviteDocument>,
     @InjectModel(User.name, GLOBAL_DB_CONNECTION) private readonly userModel: Model<UserDocument>,
     private readonly gamificationService: GamificationService,
     private readonly notificationsService: NotificationsService,
@@ -69,6 +86,7 @@ export class CircleAccessService {
     if (r.pro_only) rules.pro_only = true;
     if (r.verified_email) rules.verified_email = true;
     if (r.max_members && r.max_members > 0) rules.max_members = r.max_members;
+    if (Array.isArray(r.countries) && r.countries.length) rules.countries = r.countries;
     return rules;
   }
 
@@ -120,6 +138,17 @@ export class CircleAccessService {
         label: 'Adresse e-mail vérifiée',
         ok: user ? !!user.email_verified : null,
         detail: user && !user.email_verified ? 'Vérifie ton e-mail depuis ton profil' : undefined,
+      });
+    }
+    if (rules.countries?.length) {
+      const allowed = rules.countries.map(normalizeCountry);
+      const mine = user ? normalizeCountry(user.country) : '';
+      const shown = rules.countries.slice(0, 3).join(', ') + (rules.countries.length > 3 ? '…' : '');
+      checks.push({
+        key: 'countries',
+        label: `Voyageurs de : ${shown}`,
+        ok: user ? !!mine && allowed.includes(mine) : null,
+        detail: user ? (mine ? `Ton pays : ${user.country}` : 'Ajoute ton pays dans ton profil') : undefined,
       });
     }
     if (rules.max_members) {
@@ -324,6 +353,7 @@ export class CircleAccessService {
       eligible,
       auto_approve: !!circle.auto_approve,
       join_question: circle.join_question || '',
+      trial_days: circle.trial_days || 0,
       my_request_status: status,
     };
   }
@@ -418,18 +448,31 @@ export class CircleAccessService {
     return { cancelled: res.modifiedCount > 0, circle_id: circleId };
   }
 
-  /** Demandes d'un cercle, avec le profil de chaque voyageur (fondateur / admins). */
-  async listRequests(managerId: string, circleId: string, status = 'pending') {
-    const circle = await this.assertManager(managerId, circleId);
+  /**
+   * Demandes d'un cercle avec le profil de chaque voyageur.
+   * Fondateur / admins : décident. Autres membres : consultent et peuvent se porter garants.
+   */
+  async listRequests(viewerId: string, circleId: string, status = 'pending') {
+    const circle: any = await this.circleModel.findOne({ id: circleId }).lean().exec();
+    if (!circle) throw new NotFoundException('Cercle introuvable');
+    const membership: any = await this.memberModel.findOne({ circle_id: circle.id, user_id: viewerId }).lean().exec();
+    if (!membership) throw new ForbiddenException('Réservé aux membres du cercle');
+    const canDecide = MANAGER_ROLES.includes(membership.role);
+
     const requests: any[] = await this.requestModel
-      .find({ circle_id: circle.id, status: status === 'all' ? { $in: ['pending', 'accepted', 'rejected'] } : status })
+      .find({
+        circle_id: circle.id,
+        status: canDecide && status === 'all' ? { $in: ['pending', 'accepted', 'rejected'] } : 'pending',
+      })
       .sort({ created_at: -1 })
       .limit(100)
       .lean()
       .exec();
-    if (!requests.length) return { circle_id: circle.id, join_question: circle.join_question || '', requests: [] };
+    const base = { circle_id: circle.id, join_question: circle.join_question || '', can_decide: canDecide };
+    if (!requests.length) return { ...base, requests: [] };
 
-    const userIds = requests.map((r) => r.user_id);
+    const voucherIds = requests.flatMap((r) => (r.vouched_by || []).map((v: any) => v.user_id));
+    const userIds = [...new Set([...requests.map((r) => r.user_id), ...voucherIds])];
     const users: any[] = await this.userModel.find({ user_id: { $in: userIds } }).lean().exec();
     const userMap = new Map(users.map((u) => [u.user_id, u]));
     const membersCount = await this.memberModel.countDocuments({ circle_id: circle.id }).exec();
@@ -444,6 +487,10 @@ export class CircleAccessService {
           profile = null;
         }
         const { eligible, checks } = r.status === 'pending' ? await this.evaluate(circle, r.user_id, membersCount) : { eligible: true, checks: [] };
+        const vouches = (r.vouched_by || []).map((v: any) => {
+          const vu = userMap.get(v.user_id);
+          return { user_id: v.user_id, name: vu?.pseudo || vu?.name || 'Membre', avatar_emoji: vu?.avatar_emoji || '🧭' };
+        });
         return {
           id: r.id,
           status: r.status,
@@ -452,6 +499,8 @@ export class CircleAccessService {
           decided_at: r.decided_at,
           eligible,
           join_checks: checks,
+          vouches,
+          i_vouched: vouches.some((v: any) => v.user_id === viewerId),
           user: {
             user_id: r.user_id,
             name: u?.name || 'Voyageur',
@@ -472,7 +521,55 @@ export class CircleAccessService {
         };
       }),
     );
-    return { circle_id: circle.id, join_question: circle.join_question || '', requests: items };
+    // Les demandes parrainées passent en tête
+    items.sort((a, b) => b.vouches.length - a.vouches.length);
+    return { ...base, requests: items };
+  }
+
+  /** Un membre se porte garant (parrain) d'un voyageur qui demande à entrer. */
+  async vouch(memberId: string, requestId: string, on: boolean) {
+    const request: any = await this.requestModel.findOne({ id: requestId }).lean().exec();
+    if (!request || request.status !== 'pending') throw new NotFoundException('Demande introuvable ou déjà traitée');
+    if (request.user_id === memberId) throw new BadRequestException('Tu ne peux pas te parrainer toi-même');
+    const membership = await this.memberModel.exists({ circle_id: request.circle_id, user_id: memberId });
+    if (!membership) throw new ForbiddenException('Seuls les membres du cercle peuvent parrainer');
+
+    if (on) {
+      await this.requestModel
+        .updateOne(
+          { id: requestId, status: 'pending', 'vouched_by.user_id': { $ne: memberId } },
+          { $push: { vouched_by: { user_id: memberId, at: new Date() } } },
+        )
+        .exec();
+      const circle: any = await this.circleModel.findOne({ id: request.circle_id }).lean().exec();
+      this.notifyManagersOfVouch(circle, memberId, request);
+    } else {
+      await this.requestModel.updateOne({ id: requestId }, { $pull: { vouched_by: { user_id: memberId } } }).exec();
+    }
+    const updated: any = await this.requestModel.findOne({ id: requestId }).lean().exec();
+    return { id: requestId, vouches_count: (updated?.vouched_by || []).length, i_vouched: on };
+  }
+
+  private notifyManagersOfVouch(circle: any, voucherId: string, request: any) {
+    (async () => {
+      const [voucher, requester, managers]: [any, any, any[]] = await Promise.all([
+        this.userModel.findOne({ user_id: voucherId }).lean().exec(),
+        this.userModel.findOne({ user_id: request.user_id }).lean().exec(),
+        this.memberModel.find({ circle_id: circle.id, role: { $in: MANAGER_ROLES } }).lean().exec(),
+      ]);
+      const who = voucher?.pseudo || voucher?.name || 'Un membre';
+      const whom = requester?.pseudo || requester?.name || 'un voyageur';
+      for (const m of managers) {
+        if (m.user_id === voucherId) continue;
+        this.notificationsService.notifySafely(m.user_id, {
+          type: 'circle_request',
+          title: `🤝 ${who} se porte garant de ${whom}`,
+          body: `Demande d'adhésion à « ${circle.name} » : elle passe en tête de ta liste.`,
+          data: { circle_id: circle.id, circle_name: circle.name, kind: 'vouch', request_id: request.id },
+          dedupe_key: `circle_vouch:${request.id}:${voucherId}`,
+        });
+      }
+    })().catch((err) => this.logger.warn(`Notification de parrainage non envoyée : ${err.message}`));
   }
 
   async decide(managerId: string, requestId: string, decision: 'accept' | 'reject') {
@@ -495,9 +592,14 @@ export class CircleAccessService {
     }
 
     const status = decision === 'accept' ? 'accepted' : 'rejected';
+    const quick = Date.now() - new Date(request.created_at).getTime() <= QUICK_DECISION_MS;
     await this.requestModel
-      .updateOne({ id: request.id, status: 'pending' }, { $set: { status, decided_by: managerId, decided_at: new Date() } })
+      .updateOne(
+        { id: request.id, status: 'pending' },
+        { $set: { status, decided_by: managerId, decided_at: new Date(), quick_decision: quick } },
+      )
       .exec();
+    if (quick) this.rewardQuickDecision(managerId, request.id);
 
     this.notificationsService.notifySafely(request.user_id, {
       type: 'circle_request',
@@ -515,6 +617,17 @@ export class CircleAccessService {
     return { id: request.id, status, circle_id: circle.id };
   }
 
+  /** Fondateur réactif : XP par réponse en moins de 24 h, badge « Fondateur actif » au bout de 5. */
+  private rewardQuickDecision(managerId: string, requestId: string) {
+    (async () => {
+      await this.gamificationService.awardXpOnce(managerId, 'fondateur_reactif', requestId);
+      const quickCount = await this.requestModel.countDocuments({ decided_by: managerId, quick_decision: true }).exec();
+      if (quickCount >= ACTIVE_FOUNDER_QUICK_DECISIONS) {
+        await this.gamificationService.awardXpOnce(managerId, 'fondateur_actif', 'badge');
+      }
+    })().catch((err) => this.logger.warn(`XP fondateur non attribuée à ${managerId}: ${err.message}`));
+  }
+
   /** Réglages d'accès : conditions, acceptation automatique, question, visibilité. */
   async updateSettings(managerId: string, circleId: string, dto: UpdateCircleAccessDto) {
     const circle = await this.assertManager(managerId, circleId);
@@ -522,14 +635,17 @@ export class CircleAccessService {
     if (dto.join_rules) {
       const rules: CircleJoinRules = { ...(circle.join_rules || {}) };
       for (const [key, value] of Object.entries(dto.join_rules)) {
-        if (value === null || value === undefined || value === false || value === 0) delete (rules as any)[key];
-        else (rules as any)[key] = value;
+        const empty =
+          value === null || value === undefined || value === false || value === 0 || (Array.isArray(value) && !value.length);
+        if (empty) delete (rules as any)[key];
+        else (rules as any)[key] = Array.isArray(value) ? [...new Set(value.map((v) => String(v).trim()).filter(Boolean))] : value;
       }
       set.join_rules = rules;
     }
     if (dto.auto_approve !== undefined) set.auto_approve = dto.auto_approve;
     if (dto.join_question !== undefined) set.join_question = dto.join_question.trim();
     if (dto.listed !== undefined) set.listed = dto.listed;
+    if (dto.trial_days !== undefined) set.trial_days = dto.trial_days;
     if (Object.keys(set).length) {
       await this.circleModel.updateOne({ id: circle.id }, { $set: set }).exec();
     }
@@ -540,6 +656,214 @@ export class CircleAccessService {
       auto_approve: !!updated.auto_approve,
       join_question: updated.join_question || '',
       listed: updated.listed !== false,
+      trial_days: updated.trial_days || 0,
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Codes d'invitation à usage limité
+  // ---------------------------------------------------------------------------
+
+  private inviteDto(i: any) {
+    const expired = !!i.expires_at && new Date(i.expires_at) <= new Date();
+    const exhausted = i.max_uses != null && i.uses >= i.max_uses;
+    return {
+      code: i.code,
+      label: i.label || '',
+      max_uses: i.max_uses ?? null,
+      uses: i.uses || 0,
+      expires_at: i.expires_at || null,
+      created_at: i.created_at,
+      status: i.revoked_at ? 'revoked' : expired ? 'expired' : exhausted ? 'exhausted' : 'active',
+    };
+  }
+
+  async listInvites(managerId: string, circleId: string) {
+    const circle = await this.assertManager(managerId, circleId);
+    const invites: any[] = await this.inviteModel
+      .find({ circle_id: circle.id, revoked_at: null })
+      .sort({ created_at: -1 })
+      .limit(50)
+      .lean()
+      .exec();
+    return { circle_id: circle.id, invites: invites.map((i) => this.inviteDto(i)) };
+  }
+
+  async createInvite(managerId: string, circleId: string, dto: CreateInviteDto) {
+    const circle = await this.assertManager(managerId, circleId);
+    const active = await this.inviteModel.countDocuments({ circle_id: circle.id, revoked_at: null }).exec();
+    if (active >= 20) throw new BadRequestException('20 codes maximum : supprime un ancien code');
+    const invite = await this.inviteModel.create({
+      code: await this.uniqueInviteCode(),
+      circle_id: circle.id,
+      created_by: managerId,
+      label: (dto.label || '').trim(),
+      max_uses: dto.max_uses ?? null,
+      uses: 0,
+      expires_at: dto.expires_in_hours ? new Date(Date.now() + dto.expires_in_hours * 3600 * 1000) : null,
+    });
+    return this.inviteDto(invite.toObject());
+  }
+
+  async revokeInvite(managerId: string, circleId: string, code: string) {
+    const circle = await this.assertManager(managerId, circleId);
+    const res = await this.inviteModel
+      .updateOne({ circle_id: circle.id, code: code.toUpperCase(), revoked_at: null }, { $set: { revoked_at: new Date() } })
+      .exec();
+    return { revoked: res.modifiedCount > 0 };
+  }
+
+  private async uniqueInviteCode(): Promise<string> {
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const code = Array.from(crypto.randomBytes(8), (b) => INVITE_ALPHABET[b % INVITE_ALPHABET.length]).join('');
+      const [inCircles, inInvites] = await Promise.all([
+        this.circleModel.exists({ invite_code: code }),
+        this.inviteModel.exists({ code }),
+      ]);
+      if (!inCircles && !inInvites) return code;
+    }
+    throw new BadRequestException('Impossible de générer un code, réessaie');
+  }
+
+  /**
+   * Code à usage limité : renvoie le cercle s'il est encore valable,
+   * sinon une erreur claire (expiré, épuisé, supprimé).
+   */
+  async resolveInvite(code: string): Promise<{ circle: any; invite: any } | null> {
+    const invite: any = await this.inviteModel.findOne({ code }).lean().exec();
+    if (!invite) return null;
+    const dto = this.inviteDto(invite);
+    if (dto.status === 'revoked') throw new NotFoundException("Ce code d'invitation a été désactivé");
+    if (dto.status === 'expired') throw new NotFoundException("Ce code d'invitation a expiré : demande-en un nouveau");
+    if (dto.status === 'exhausted') {
+      throw new NotFoundException("Ce code d'invitation a déjà été utilisé le nombre de fois prévu");
+    }
+    const circle: any = await this.circleModel.findOne({ id: invite.circle_id }).exec();
+    if (!circle) throw new NotFoundException("Code d'invitation invalide");
+    return { circle, invite };
+  }
+
+  /** Consomme une utilisation, de façon atomique (pas de dépassement en cas d'entrées simultanées). */
+  async consumeInvite(invite: any): Promise<void> {
+    const now = new Date();
+    const res = await this.inviteModel
+      .updateOne(
+        {
+          code: invite.code,
+          revoked_at: null,
+          $and: [
+            { $or: [{ expires_at: null }, { expires_at: { $gt: now } }] },
+            { $or: [{ max_uses: null }, { $expr: { $lt: ['$uses', '$max_uses'] } }] },
+          ],
+        },
+        { $inc: { uses: 1 } },
+      )
+      .exec();
+    if (res.modifiedCount === 0) {
+      throw new NotFoundException("Ce code d'invitation n'est plus valable");
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Période d'essai : les nouveaux membres lisent avant de publier
+  // ---------------------------------------------------------------------------
+
+  /** Fin de période d'essai d'un membre (null = peut publier). */
+  trialUntil(circle: any, membership: any): Date | null {
+    const days = circle?.trial_days || 0;
+    if (!days || !membership || MANAGER_ROLES.includes(membership.role) || !membership.joined_at) return null;
+    const until = new Date(new Date(membership.joined_at).getTime() + days * 24 * 3600 * 1000);
+    return until > new Date() ? until : null;
+  }
+
+  /** Publier, partager un voyage ou commenter : refusé pendant la période d'essai. */
+  async assertCanContribute(circleId: string, userId: string): Promise<void> {
+    const circle: any = await this.circleModel.findOne({ id: circleId }).select('id trial_days').lean().exec();
+    if (!circle?.trial_days) return;
+    const membership: any = await this.memberModel.findOne({ circle_id: circleId, user_id: userId }).lean().exec();
+    const until = this.trialUntil(circle, membership);
+    if (until) {
+      throw new ForbiddenException({
+        statusCode: 403,
+        code: 'TRIAL_PERIOD',
+        trial_until: until,
+        message: `Période de découverte : tu pourras publier dans cette tribu à partir du ${until.toLocaleDateString('fr-FR')}`,
+      });
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Mes cercles et mes demandes (menu Paramètres des tribus)
+  // ---------------------------------------------------------------------------
+
+  async myCircles(userId: string) {
+    const memberships: any[] = await this.memberModel.find({ user_id: userId }).lean().exec();
+    if (!memberships.length) return { circles: [] };
+    const circles: any[] = await this.circleModel
+      .find({ id: { $in: memberships.map((m) => m.circle_id) } })
+      .lean()
+      .exec();
+    const circleIds = circles.map((c) => c.id);
+    const [counts, pending] = await Promise.all([
+      this.memberModel.aggregate([
+        { $match: { circle_id: { $in: circleIds } } },
+        { $group: { _id: '$circle_id', count: { $sum: 1 } } },
+      ]),
+      this.pendingCounts(circleIds),
+    ]);
+    const countMap = new Map(counts.map((c: any) => [c._id, c.count]));
+    const roleRank: Record<string, number> = { creator: 0, admin: 1, explorer: 2 };
+    const items = circles.map((c) => {
+      const m = memberships.find((x) => x.circle_id === c.id);
+      const manager = MANAGER_ROLES.includes(m?.role);
+      return {
+        id: c.id,
+        name: c.name,
+        avatar_emoji: c.avatar_emoji || '🧭',
+        cover_image_url: c.cover_image_url || null,
+        is_public: !!c.is_public,
+        listed: c.listed !== false,
+        my_role: m?.role || 'explorer',
+        joined_at: m?.joined_at || null,
+        members_count: countMap.get(c.id) || 0,
+        join_rules: this.activeRules(c),
+        auto_approve: !!c.auto_approve,
+        trial_days: c.trial_days || 0,
+        trial_until: this.trialUntil(c, m),
+        pending_requests_count: pending.get(c.id) || 0,
+        can_manage: manager,
+      };
+    });
+    items.sort((a, b) => (roleRank[a.my_role] ?? 3) - (roleRank[b.my_role] ?? 3) || a.name.localeCompare(b.name));
+    return { circles: items };
+  }
+
+  async myJoinRequests(userId: string) {
+    const requests: any[] = await this.requestModel
+      .find({ user_id: userId, status: { $in: ['pending', 'rejected'] } })
+      .sort({ created_at: -1 })
+      .limit(30)
+      .lean()
+      .exec();
+    const circles: any[] = await this.circleModel
+      .find({ id: { $in: requests.map((r) => r.circle_id) } })
+      .select('id name avatar_emoji')
+      .lean()
+      .exec();
+    const circleMap = new Map(circles.map((c) => [c.id, c]));
+    return {
+      requests: requests
+        .filter((r) => circleMap.has(r.circle_id))
+        .map((r) => ({
+          id: r.id,
+          circle_id: r.circle_id,
+          circle_name: circleMap.get(r.circle_id)!.name,
+          circle_emoji: circleMap.get(r.circle_id)!.avatar_emoji || '🧭',
+          status: r.status,
+          created_at: r.created_at,
+          decided_at: r.decided_at,
+          vouches_count: (r.vouched_by || []).length,
+        })),
     };
   }
 

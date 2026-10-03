@@ -24,7 +24,7 @@ import { CommunitySocialService } from './community-social.service';
 import { TribeTripsService } from './tribe-trips.service';
 import { CircleChallengesService } from './circle-challenges.service';
 import { CircleAccessService } from './circle-access.service';
-import { JoinRequestDto, SetMemberRoleDto, UpdateCircleAccessDto } from './dto/circle-access.dto';
+import { CreateInviteDto, JoinRequestDto, SetMemberRoleDto, UpdateCircleAccessDto } from './dto/circle-access.dto';
 import { CreateTripPlanDto, JoinTripPlanDto, VoteTripPlanDto } from './dto/create-trip-plan.dto';
 import { COMMENT_TARGET_TYPES, CommentTargetType } from './schemas/community-comment.schema';
 import { ApiTags, ApiBearerAuth, ApiOperation } from '@nestjs/swagger';
@@ -173,6 +173,51 @@ export class CommunityController {
   @UseGuards(SessionAuthGuard)
   async listJoinRequests(@CurrentUser() user: any, @Param('id') id: string, @Query('status') status?: string) {
     return this.circleAccessService.listRequests(user.user_id, id, status || 'pending');
+  }
+
+  /** Se porter garant d'un voyageur (parrainage par un membre) */
+  @Post('join-requests/:requestId/vouch')
+  @UseGuards(SessionAuthGuard)
+  async vouchJoinRequest(@CurrentUser() user: any, @Param('requestId') requestId: string) {
+    return this.circleAccessService.vouch(user.user_id, requestId, true);
+  }
+
+  @Delete('join-requests/:requestId/vouch')
+  @UseGuards(SessionAuthGuard)
+  async unvouchJoinRequest(@CurrentUser() user: any, @Param('requestId') requestId: string) {
+    return this.circleAccessService.vouch(user.user_id, requestId, false);
+  }
+
+  /** Codes d'invitation à usage limité (fondateur / admins) */
+  @Get('circles/:id/invites')
+  @UseGuards(SessionAuthGuard)
+  async listInvites(@CurrentUser() user: any, @Param('id') id: string) {
+    return this.circleAccessService.listInvites(user.user_id, id);
+  }
+
+  @Post('circles/:id/invites')
+  @UseGuards(SessionAuthGuard)
+  async createInvite(@CurrentUser() user: any, @Param('id') id: string, @Body() dto: CreateInviteDto) {
+    return this.circleAccessService.createInvite(user.user_id, id, dto);
+  }
+
+  @Delete('circles/:id/invites/:code')
+  @UseGuards(SessionAuthGuard)
+  async revokeInvite(@CurrentUser() user: any, @Param('id') id: string, @Param('code') code: string) {
+    return this.circleAccessService.revokeInvite(user.user_id, id, code);
+  }
+
+  /** Mes cercles (rôle, demandes en attente, essai) et mes demandes d'adhésion */
+  @Get('me/circles')
+  @UseGuards(SessionAuthGuard)
+  async myCircles(@CurrentUser() user: any) {
+    return this.circleAccessService.myCircles(user.user_id);
+  }
+
+  @Get('me/join-requests')
+  @UseGuards(SessionAuthGuard)
+  async myJoinRequests(@CurrentUser() user: any) {
+    return this.circleAccessService.myJoinRequests(user.user_id);
   }
 
   @Post('join-requests/:requestId/accept')

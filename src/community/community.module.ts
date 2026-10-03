@@ -22,6 +22,7 @@ import { PlaceReview, PlaceReviewSchema } from '../places/schemas/place-review.s
 import { TribeTripsService } from './tribe-trips.service';
 import { CircleAccessService } from './circle-access.service';
 import { CircleJoinRequest, CircleJoinRequestSchema } from './schemas/circle-join-request.schema';
+import { CircleInvite, CircleInviteSchema } from './schemas/circle-invite.schema';
 import { CircleChallengesService } from './circle-challenges.service';
 import { NotificationsModule } from '../notifications/notifications.module';
 import { SessionAuthGuard } from '../common/guards/session-auth.guard';
@@ -47,6 +48,7 @@ import { GLOBAL_DB_CONNECTION, TENANT_DB_CONNECTION } from '../common/constants'
         { name: CircleTripVote.name, schema: CircleTripVoteSchema },
         { name: CircleChallengeCompletion.name, schema: CircleChallengeCompletionSchema },
         { name: CircleJoinRequest.name, schema: CircleJoinRequestSchema },
+        { name: CircleInvite.name, schema: CircleInviteSchema },
       ],
       TENANT_DB_CONNECTION,
     ),
