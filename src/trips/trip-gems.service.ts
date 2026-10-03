@@ -3,6 +3,7 @@ import { TenancyService } from '../tenancy/tenancy.service';
 import { GamificationService } from '../gamification/gamification.service';
 import { AiService } from '../ai/ai.service';
 import { TripDocument, TripSchema } from './schemas/trip.schema';
+import { PERFECT_DAY_BONUS, completesPerfectDay, gemShards } from './gem-shards';
 
 /** XP d'une pépite selon sa rareté (fixée par le serveur, jamais par l'IA ni l'app) */
 export const GEM_XP: Record<string, number> = { commune: 5, rare: 10, legendaire: 20 };
@@ -197,6 +198,16 @@ export class TripGemsService {
     } catch (err: any) {
       this.logger.warn(`XP pépite non attribuée à ${userId}: ${err.message}`);
     }
-    return { collected: true, already: false, xp_awarded: GEM_XP[rarity], gem_id: gemId, gamification };
+    // Éclats : valeur de la pépite, + bonus si toute la journée est ramassée (les XP ne sont pas touchés)
+    const perfectDay = completesPerfectDay(trip, gemId);
+    return {
+      collected: true,
+      already: false,
+      xp_awarded: GEM_XP[rarity],
+      shards_awarded: gemShards(gem) + (perfectDay ? PERFECT_DAY_BONUS : 0),
+      perfect_day: perfectDay,
+      gem_id: gemId,
+      gamification,
+    };
   }
 }

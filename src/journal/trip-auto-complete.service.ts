@@ -196,14 +196,17 @@ export class TripAutoCompleteService implements OnModuleInit, OnModuleDestroy {
       if (!rainy) return;
       const user: any = await this.userModel.findOne({ user_id: entry.user_id }).select('is_pro pro_tier pro_expires_at').lean().exec();
       const pro = !!user && isProActive(user);
+      // Pépite légendaire ramassée : un plan B offert en gratuit
+      const gift =
+        !pro && !trip.edits?.plan_b_gift_used && (trip.gems || []).some((g: any) => g.rarity === 'legendaire' && g.collected_at);
       const what = summary ? String(summary).toLowerCase() : 'de la pluie';
       this.notificationsService.notifySafely(entry.user_id, {
         type: 'plan_b',
         title: pro ? `☔ Plan B pour le jour ${day} à ${entry.destination}` : `☔ Pluie annoncée le jour ${day} à ${entry.destination}`,
-        body: pro
-          ? `Demain : ${what}. Un programme à l'abri (musées, marchés couverts, cafés…) en un geste ?`
+        body: pro || gift
+          ? `Demain : ${what}. ${gift ? 'Ta pépite légendaire t’offre un plan B : ' : ''}un programme à l'abri (musées, marchés couverts, cafés…) en un geste ?`
           : `Demain : ${what}. Avec Pro, ton plan B à l'abri se prépare en un geste 💎`,
-        data: { trip_id: entry.trip_id, day, plan_b: true, pro },
+        data: { trip_id: entry.trip_id, day, plan_b: true, pro, gift },
         dedupe_key: `plan_b:${entry.trip_id}:${day}`,
       });
       const TripModel = await this.tenancyService.getTenantModel<TripDocument>(entry.user_id, 'Trip', TripSchema);

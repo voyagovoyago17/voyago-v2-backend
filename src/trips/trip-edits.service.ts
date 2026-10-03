@@ -13,6 +13,7 @@ import { GenerateTripDto } from './dto/generate-trip.dto';
 import { TripsService } from './trips.service';
 import { TripScheduleService } from './trip-schedule.service';
 import { TripBookingsService } from './trip-bookings.service';
+import { SHARD_CREDITS_PER_TRIP, SHARDS_PER_CREDIT, shardsOfTrip } from './gem-shards';
 
 export type EditPlan = 'free' | 'monthly' | 'annual' | 'lifetime';
 
@@ -28,8 +29,6 @@ export const EDIT_LIMITS: Record<EditPlan, { swaps: number; redos: number }> = {
   annual: { swaps: Infinity, redos: 4 },
   lifetime: { swaps: Infinity, redos: 6 },
 };
-/** Un crédit de modification en échange d'XP (le niveau n'est pas touché) */
-export const XP_PER_CREDIT = 50;
 /** Pack de crédits payant pour un voyage */
 export const EDIT_PACK = { credits: 3, price: 0.99, currency: 'eur' };
 
@@ -94,21 +93,60 @@ export class TripEditsService {
 
   async options(userId: string, tripId: string) {
     const { trip, user } = await this.load(userId, tripId);
-    return this.optionsFor(trip, user, await this.xpBalance(userId));
+    return this.optionsFor(trip, user, await this.shardBalance(userId));
   }
 
-  /** XP disponibles pour des crédits : gagnés − déjà dépensés */
-  private async xpBalance(userId: string): Promise<number | null> {
+  /**
+   * Bourse d'Éclats : pépites ramassées sur tous les voyages (+ journées parfaites) − Éclats dépensés.
+   * Calculée depuis les voyages : rétroactive, et les XP de niveau ne sont jamais touchés.
+   */
+  async shardWallet(userId: string) {
+    const [TripModel, ProfileModel] = await Promise.all([
+      this.tripModel(userId),
+      this.tenancyService.getTenantModel<any>(userId, 'Profile', ProfileSchema),
+    ]);
+    const [trips, profile] = await Promise.all([
+      TripModel.find({ user_id: userId, 'gems.collected_at': { $ne: null } }).select('id destination city gems').lean().exec(),
+      ProfileModel.findOne({ user_id: userId }).select('gem_points_spent').lean().exec() as Promise<any>,
+    ]);
+    let earned = 0;
+    let gems = 0;
+    let perfectDays = 0;
+    for (const t of trips as any[]) {
+      const s = shardsOfTrip(t);
+      earned += s.earned;
+      gems += s.gems;
+      perfectDays += s.perfect_days.length;
+    }
+    const spent = profile?.gem_points_spent ?? 0;
+    return {
+      balance: Math.max(0, earned - spent),
+      earned,
+      spent,
+      gems_collected: gems,
+      perfect_days: perfectDays,
+      per_credit: SHARDS_PER_CREDIT,
+    };
+  }
+
+  private async shardBalance(userId: string): Promise<number | null> {
     try {
-      const ProfileModel = await this.tenancyService.getTenantModel<any>(userId, 'Profile', ProfileSchema);
-      const p: any = await ProfileModel.findOne({ user_id: userId }).select('xp xp_spent').lean().exec();
-      return p ? Math.max(0, (p.xp ?? 0) - (p.xp_spent ?? 0)) : 0;
+      return (await this.shardWallet(userId)).balance;
     } catch {
       return null;
     }
   }
 
-  private optionsFor(trip: any, user: any, xpBalance: number | null = null) {
+  /** Une pépite légendaire ramassée sur ce voyage offre un plan B pluie (formule gratuite) */
+  private planBGift(trip: any, plan: EditPlan) {
+    return (
+      plan === 'free' &&
+      !trip.edits?.plan_b_gift_used &&
+      (trip.gems || []).some((g: any) => g.rarity === 'legendaire' && g.collected_at)
+    );
+  }
+
+  private optionsFor(trip: any, user: any, shardBalance: number | null = null) {
     const plan = this.planOf(user);
     const limits = EDIT_LIMITS[plan];
     const edits = trip.edits || {};
@@ -135,8 +173,13 @@ export class TripEditsService {
       can_regenerate: !st.started && !st.finished,
       can_edit_places: !trip.tribe_plan?.founder_id || trip.tribe_plan.founder_id === user?.user_id,
       plan_b_days: edits.plan_b_days ?? [],
-      xp_per_credit: XP_PER_CREDIT,
-      xp_balance: xpBalance,
+      plan_b_gift: this.planBGift(trip, plan),
+      shards: {
+        balance: shardBalance,
+        per_credit: SHARDS_PER_CREDIT,
+        trip_credits: { used: edits.shard_credits ?? 0, limit: SHARD_CREDITS_PER_TRIP[plan === 'free' ? 'free' : 'pro'] },
+        earned_on_trip: shardsOfTrip(trip).earned,
+      },
       pack: EDIT_PACK,
       plans: Object.fromEntries(
         Object.entries(EDIT_LIMITS).map(([k, v]) => [k, { swaps: Number.isFinite(v.swaps) ? v.swaps : null, redos: v.redos }]),
@@ -302,7 +345,7 @@ export class TripEditsService {
 
     if (opts.planB) {
       // Plan B pluie : avantage Pro, une fois par journée, sans entamer le quota
-      if (plan === 'free') {
+      if (plan === 'free' && !this.planBGift(trip, plan)) {
         throw this.quotaError('redo', plan, 'Le plan B pluie est un avantage Pro : un nouveau programme à l’abri en un geste.');
       }
       if ((trip.edits?.plan_b_days ?? []).includes(day)) throw new BadRequestException('Le plan B de cette journée est déjà appliqué.');
@@ -327,7 +370,10 @@ export class TripEditsService {
     const gems = (trip.gems || []).filter((g: any) => g.day !== day || g.collected_at);
     await TripModel.updateOne(
       { id: tripId },
-      { $set: { pois: next, gems }, ...(opts.planB ? { $addToSet: { 'edits.plan_b_days': day } } : {}) },
+      {
+        $set: { pois: next, gems, ...(opts.planB && plan === 'free' ? { 'edits.plan_b_gift_used': true } : {}) },
+        ...(opts.planB ? { $addToSet: { 'edits.plan_b_days': day } } : {}),
+      },
     ).exec();
     this.logger.log(`Voyage ${tripId} : jour ${day} refait${opts.planB ? ' (plan B pluie)' : ''}`);
     return this.result(userId, tripId);
@@ -403,19 +449,34 @@ export class TripEditsService {
   // Crédits en plus : XP et pack payant
   // ---------------------------------------------------------------------------
 
-  async creditWithXp(userId: string, tripId: string) {
-    const { TripModel, trip } = await this.load(userId, tripId);
+  /** 1 modification contre des Éclats (pépites ramassées), dans la limite par voyage */
+  async creditWithShards(userId: string, tripId: string) {
+    const { TripModel, trip, user } = await this.load(userId, tripId);
     if (this.stage(trip).finished) throw new BadRequestException('Ce voyage est terminé.');
-    const ProfileModel = await this.tenancyService.getTenantModel<any>(userId, 'Profile', ProfileSchema);
-    // Solde = XP gagnés − XP dépensés : le niveau, calculé sur les XP gagnés, ne baisse jamais
-    const res = await ProfileModel.updateOne(
-      { user_id: userId, $expr: { $gte: [{ $subtract: ['$xp', { $ifNull: ['$xp_spent', 0] }] }, XP_PER_CREDIT] } },
-      { $inc: { xp_spent: XP_PER_CREDIT } },
-    ).exec();
-    if (res.modifiedCount === 0) {
-      throw new BadRequestException(`Il te faut ${XP_PER_CREDIT} XP disponibles pour débloquer une modification.`);
+    const plan = this.planOf(user);
+    const cap = SHARD_CREDITS_PER_TRIP[plan === 'free' ? 'free' : 'pro'];
+    if ((trip.edits?.shard_credits ?? 0) >= cap) {
+      throw new BadRequestException(
+        plan === 'free'
+          ? 'Tu as déjà échangé tes Éclats sur ce voyage (1 par voyage en gratuit, 3 avec Pro).'
+          : `Tu as déjà échangé ${cap} modifications contre des Éclats sur ce voyage.`,
+      );
     }
-    await TripModel.updateOne({ id: tripId }, { $inc: { 'edits.extra_credits': 1 } }).exec();
+    const wallet = await this.shardWallet(userId);
+    if (wallet.balance < SHARDS_PER_CREDIT) {
+      throw new BadRequestException(
+        `Il te manque ${SHARDS_PER_CREDIT - wallet.balance} Éclats : ramasse des pépites pendant ton voyage pour en gagner.`,
+      );
+    }
+    // Dépense conditionnée au solde lu : deux échanges simultanés ne dépensent pas deux fois les mêmes Éclats
+    const ProfileModel = await this.tenancyService.getTenantModel<any>(userId, 'Profile', ProfileSchema);
+    const res = await ProfileModel.updateOne(
+      { user_id: userId, gem_points_spent: wallet.spent ? wallet.spent : { $in: [0, null] } },
+      { $inc: { gem_points_spent: SHARDS_PER_CREDIT } },
+    ).exec();
+    if (res.modifiedCount === 0) throw new BadRequestException('Ton solde vient de changer, réessaie.');
+    await TripModel.updateOne({ id: tripId }, { $inc: { 'edits.extra_credits': 1, 'edits.shard_credits': 1 } }).exec();
+    this.logger.log(`Voyage ${tripId} : 1 modification contre ${SHARDS_PER_CREDIT} Éclats`);
     return this.result(userId, tripId);
   }
 
@@ -441,6 +502,6 @@ export class TripEditsService {
 
   private async result(userId: string, tripId: string) {
     const { trip, user } = await this.load(userId, tripId);
-    return { trip, options: this.optionsFor(trip, user, await this.xpBalance(userId)) };
+    return { trip, options: this.optionsFor(trip, user, await this.shardBalance(userId)) };
   }
 }

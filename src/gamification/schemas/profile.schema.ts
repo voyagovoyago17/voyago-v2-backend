@@ -14,9 +14,9 @@ export class Profile {
   @Prop({ default: 0 })
   xp: number;
 
-  /** XP échangés contre des crédits de modification (le niveau reste calculé sur `xp`) */
+  /** Éclats (pépites ramassées) échangés contre des modifications : jamais retirés des XP */
   @Prop({ default: 0 })
-  xp_spent: number;
+  gem_points_spent: number;
 
   @Prop({ default: 1 })
   level: number;

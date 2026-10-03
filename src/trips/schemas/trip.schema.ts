@@ -179,6 +179,10 @@ export class Trip {
     extra_credits?: number;
     plan_b_days?: number[];
     plan_b_notified?: number[];
+    /** Modifications payées en Éclats sur ce voyage */
+    shard_credits?: number;
+    /** Plan B offert par une pépite légendaire (formule gratuite) déjà utilisé */
+    plan_b_gift_used?: boolean;
   };
 }
 

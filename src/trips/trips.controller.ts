@@ -250,12 +250,20 @@ export class TripsController {
     return this.tripEdits.regenerate(user.user_id, trip_id, dto);
   }
 
-  @ApiOperation({ summary: 'Échanger des XP contre une modification en plus' })
+  @ApiOperation({ summary: 'Échanger des Éclats (pépites ramassées) contre une modification en plus' })
   @ApiBearerAuth()
-  @Post('trip/:trip_id/edit-credits/xp')
+  @Post('trip/:trip_id/edit-credits/shards')
   @UseGuards(SessionAuthGuard)
-  async creditWithXp(@CurrentUser() user: any, @Param('trip_id') trip_id: string) {
-    return this.tripEdits.creditWithXp(user.user_id, trip_id);
+  async creditWithShards(@CurrentUser() user: any, @Param('trip_id') trip_id: string) {
+    return this.tripEdits.creditWithShards(user.user_id, trip_id);
+  }
+
+  @ApiOperation({ summary: 'Ma bourse d’Éclats (pépites ramassées)' })
+  @ApiBearerAuth()
+  @Get('me/shards')
+  @UseGuards(SessionAuthGuard)
+  async myShards(@CurrentUser() user: any) {
+    return this.tripEdits.shardWallet(user.user_id);
   }
 
   /** Ajouter ou changer les dates d'un voyage (la fin découle de la durée) */
