@@ -55,6 +55,10 @@ jobs:
               console.log('Connecté :', email, '(user_id', auth.body.user_id + ')');
               const res = await post('/notifications/test', {}, auth.body.session_token);
               const r = res.body;
+              if (res.status >= 400) {
+                console.log('Erreur API', res.status, ':', JSON.stringify(r));
+                process.exit(1);
+              }
               console.log('FCM actif :', r.push_enabled, '| appareils enregistrés :', r.devices, '| envoyés :', r.sent, '| échecs :', r.failed);
               if (!r.devices) console.log('→ Aucun appareil : connecte-toi avec ce compte dans l\'app (notifications acceptées), puis relance ce test.');
               await fetch(api + '/auth/logout', { method: 'POST', headers: { Authorization: 'Bearer ' + auth.body.session_token } }).catch(() => {});
