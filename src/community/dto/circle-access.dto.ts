@@ -1,5 +1,5 @@
 import { Type } from 'class-transformer';
-import { IsBoolean, IsInt, IsOptional, IsString, Max, MaxLength, Min, ValidateNested } from 'class-validator';
+import { IsBoolean, IsIn, IsInt, IsOptional, IsString, Max, MaxLength, Min, ValidateNested } from 'class-validator';
 
 export class JoinRulesDto {
   @IsOptional()
@@ -55,4 +55,9 @@ export class JoinRequestDto {
   @IsString()
   @MaxLength(500)
   message?: string;
+}
+
+export class SetMemberRoleDto {
+  @IsIn(['admin', 'explorer'])
+  role: 'admin' | 'explorer';
 }

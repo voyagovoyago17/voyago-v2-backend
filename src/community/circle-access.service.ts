@@ -147,9 +147,137 @@ export class CircleAccessService {
   async assertCanJoin(circle: any, userId: string): Promise<void> {
     const { eligible, checks } = await this.evaluate(circle, userId);
     if (!eligible) {
-      const missing = checks.filter((c) => c.ok === false).map((c) => c.detail || c.label);
-      throw new ForbiddenException(`Conditions d'accès non remplies : ${missing.join(' · ')}`);
+      const failed = checks.filter((c) => c.ok === false);
+      const underAge = failed.some((c) => c.key === 'min_age');
+      // Corps structuré : l'app affiche une fenêtre claire (mineurs, places, niveau...)
+      throw new ForbiddenException({
+        statusCode: 403,
+        code: 'JOIN_CONDITIONS',
+        message: underAge
+          ? `Ce cercle est réservé aux voyageurs de ${this.activeRules(circle).min_age} ans et plus`
+          : `Conditions d'accès non remplies : ${failed.map((c) => c.detail || c.label).join(' · ')}`,
+        circle_name: circle.name,
+        under_age: underAge,
+        join_checks: checks,
+      });
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Membres (réservé aux membres) et gestion par le fondateur
+  // ---------------------------------------------------------------------------
+
+  /** Membres d'un cercle, page par page, avec leur niveau (le contenu reste réservé aux membres). */
+  async listMembers(viewerId: string | undefined, circleId: string, skip = 0, limit = 30) {
+    const circle: any = await this.circleModel.findOne({ $or: [{ id: circleId }, { slug: circleId }] }).lean().exec();
+    if (!circle) throw new NotFoundException('Cercle introuvable');
+    const viewer: any = viewerId
+      ? await this.memberModel.findOne({ circle_id: circle.id, user_id: viewerId }).lean().exec()
+      : null;
+    if (!circle.is_public && !viewer) {
+      throw new ForbiddenException('La liste des membres est réservée aux membres du cercle');
+    }
+
+    const safeLimit = Math.min(Math.max(limit, 1), 50);
+    const [members, total]: [any[], number] = await Promise.all([
+      // Fondateur, puis admins, puis les arrivées les plus récentes
+      this.memberModel
+        .aggregate([
+          { $match: { circle_id: circle.id } },
+          {
+            $addFields: {
+              rank: { $switch: { branches: [{ case: { $eq: ['$role', 'creator'] }, then: 0 }, { case: { $eq: ['$role', 'admin'] }, then: 1 }], default: 2 } },
+            },
+          },
+          { $sort: { rank: 1, joined_at: -1 } },
+          { $skip: Math.max(skip, 0) },
+          { $limit: safeLimit },
+        ])
+        .exec(),
+      this.memberModel.countDocuments({ circle_id: circle.id }).exec(),
+    ]);
+    const hidden = new Set(
+      viewerId
+        ? (
+            await this.blockModel
+              .find({ $or: [{ blocker_id: viewerId }, { blocked_id: viewerId }] })
+              .select('blocker_id blocked_id')
+              .lean()
+              .exec()
+          ).map((b: any) => (b.blocker_id === viewerId ? b.blocked_id : b.blocker_id))
+        : [],
+    );
+    const users: any[] = await this.userModel.find({ user_id: { $in: members.map((m) => m.user_id) } }).lean().exec();
+    const userMap = new Map(users.map((u) => [u.user_id, u]));
+
+    const items = await Promise.all(
+      members
+        .filter((m) => !hidden.has(m.user_id))
+        .map(async (m) => {
+          const u = userMap.get(m.user_id);
+          return {
+            user_id: m.user_id,
+            role: m.role,
+            joined_at: m.joined_at,
+            name: u?.name || 'Voyageur',
+            pseudo: u?.pseudo || null,
+            avatar_emoji: u?.avatar_emoji || '🧭',
+            picture: u?.picture || null,
+            country: u?.country || null,
+            is_pro: isProActive(u),
+            email_verified: !!u?.email_verified,
+            level: await this.levelOf(m.user_id),
+          };
+        }),
+    );
+    const rules = this.activeRules(circle);
+    return {
+      circle_id: circle.id,
+      total,
+      max_members: rules.max_members ?? null,
+      my_role: viewer?.role ?? null,
+      has_more: skip + members.length < total,
+      members: items,
+    };
+  }
+
+  /** Retirer un membre : le fondateur retire n'importe qui, un admin seulement les explorateurs. */
+  async removeMember(managerId: string, circleId: string, memberId: string) {
+    const circle = await this.assertManager(managerId, circleId);
+    if (managerId === memberId) throw new BadRequestException('Pour partir, utilise « Quitter le cercle »');
+    const [manager, target]: any[] = await Promise.all([
+      this.memberModel.findOne({ circle_id: circle.id, user_id: managerId }).lean().exec(),
+      this.memberModel.findOne({ circle_id: circle.id, user_id: memberId }).lean().exec(),
+    ]);
+    if (!target) throw new NotFoundException("Ce voyageur n'est pas membre du cercle");
+    if (target.role === 'creator' || (manager.role === 'admin' && target.role === 'admin')) {
+      throw new ForbiddenException('Tu ne peux pas retirer ce membre');
+    }
+    await this.memberModel.deleteOne({ circle_id: circle.id, user_id: memberId }).exec();
+    const count = await this.memberModel.countDocuments({ circle_id: circle.id }).exec();
+    await this.circleModel.updateOne({ id: circle.id }, { $set: { members_count: count } }).exec();
+    return { removed: true, circle_id: circle.id, members_count: count };
+  }
+
+  /** Nommer ou retirer un admin (fondateur uniquement). */
+  async setMemberRole(founderId: string, circleId: string, memberId: string, role: 'admin' | 'explorer') {
+    const circle = await this.assertManager(founderId, circleId);
+    const founder: any = await this.memberModel.findOne({ circle_id: circle.id, user_id: founderId }).lean().exec();
+    if (founder?.role !== 'creator') throw new ForbiddenException('Seul le fondateur nomme les admins');
+    if (founderId === memberId) throw new BadRequestException('Le fondateur reste fondateur');
+    const res = await this.memberModel
+      .updateOne({ circle_id: circle.id, user_id: memberId, role: { $ne: 'creator' } }, { $set: { role } })
+      .exec();
+    if (res.matchedCount === 0) throw new NotFoundException("Ce voyageur n'est pas membre du cercle");
+    if (role === 'admin') {
+      this.notificationsService.notifySafely(memberId, {
+        type: 'circle_request',
+        title: `⭐ Tu es maintenant admin de « ${circle.name} »`,
+        body: "Tu peux accepter les demandes et gérer les conditions d'accès.",
+        data: { circle_id: circle.id, circle_name: circle.name, kind: 'promoted' },
+      });
+    }
+    return { user_id: memberId, role };
   }
 
   // ---------------------------------------------------------------------------

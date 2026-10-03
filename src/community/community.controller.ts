@@ -24,7 +24,7 @@ import { CommunitySocialService } from './community-social.service';
 import { TribeTripsService } from './tribe-trips.service';
 import { CircleChallengesService } from './circle-challenges.service';
 import { CircleAccessService } from './circle-access.service';
-import { JoinRequestDto, UpdateCircleAccessDto } from './dto/circle-access.dto';
+import { JoinRequestDto, SetMemberRoleDto, UpdateCircleAccessDto } from './dto/circle-access.dto';
 import { CreateTripPlanDto, JoinTripPlanDto, VoteTripPlanDto } from './dto/create-trip-plan.dto';
 import { COMMENT_TARGET_TYPES, CommentTargetType } from './schemas/community-comment.schema';
 import { ApiTags, ApiBearerAuth, ApiOperation } from '@nestjs/swagger';
@@ -192,6 +192,35 @@ export class CommunityController {
   @UseGuards(SessionAuthGuard)
   async updateCircleAccess(@CurrentUser() user: any, @Param('id') id: string, @Body() dto: UpdateCircleAccessDto) {
     return this.circleAccessService.updateSettings(user.user_id, id, dto);
+  }
+
+  /** Membres du cercle (réservé aux membres pour un cercle privé) */
+  @Get('circles/:id/members')
+  async listCircleMembers(
+    @Param('id') id: string,
+    @Query('skip') skip?: string,
+    @Query('limit') limit?: string,
+    @Headers('authorization') authHeader?: string,
+  ) {
+    const viewerId = await this.communityService.authUserId(authHeader);
+    return this.circleAccessService.listMembers(viewerId, id, skip ? parseInt(skip, 10) || 0 : 0, limit ? parseInt(limit, 10) || 30 : 30);
+  }
+
+  @Delete('circles/:id/members/:userId')
+  @UseGuards(SessionAuthGuard)
+  async removeCircleMember(@CurrentUser() user: any, @Param('id') id: string, @Param('userId') memberId: string) {
+    return this.circleAccessService.removeMember(user.user_id, id, memberId);
+  }
+
+  @Patch('circles/:id/members/:userId/role')
+  @UseGuards(SessionAuthGuard)
+  async setCircleMemberRole(
+    @CurrentUser() user: any,
+    @Param('id') id: string,
+    @Param('userId') memberId: string,
+    @Body() dto: SetMemberRoleDto,
+  ) {
+    return this.circleAccessService.setMemberRole(user.user_id, id, memberId, dto.role);
   }
 
   /** Générer un nouveau code d'invitation (créateur / admin d'un cercle privé) */
