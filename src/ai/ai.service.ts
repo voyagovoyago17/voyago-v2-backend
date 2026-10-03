@@ -3,6 +3,7 @@ import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import { CatalogImage, CatalogImageDocument } from '../catalog/schemas/catalog-image.schema';
 import { GLOBAL_DB_CONNECTION } from '../common/constants';
+import { GroundedPlace, GroundingScope, PlaceGroundingService, kmBetween, nameSimilarity } from './place-grounding.service';
 import { ConfigService } from '@nestjs/config';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import Anthropic from '@anthropic-ai/sdk';
@@ -23,8 +24,6 @@ const POI_RESPONSE_SCHEMA: ResponseSchema = {
     duration_minutes: { type: SchemaType.INTEGER },
     category: { type: SchemaType.STRING },
     image_query: { type: SchemaType.STRING },
-    rating: { type: SchemaType.NUMBER },
-    reviews_count: { type: SchemaType.INTEGER },
     insider_tip: { type: SchemaType.STRING },
     hidden_gem: { type: SchemaType.BOOLEAN },
   },
@@ -388,14 +387,12 @@ const POIS_JSON_SCHEMA = {
           duration_minutes: { type: 'integer' },
           category: { type: 'string' },
           image_query: { type: 'string' },
-          rating: { type: 'number' },
-          reviews_count: { type: 'integer' },
           insider_tip: { type: 'string' },
           hidden_gem: { type: 'boolean' },
         },
         required: [
           'name', 'description', 'lat', 'lng', 'day', 'order', 'duration_minutes',
-          'category', 'image_query', 'rating', 'reviews_count', 'insider_tip', 'hidden_gem',
+          'category', 'image_query', 'insider_tip', 'hidden_gem',
         ],
         additionalProperties: false,
       },
@@ -457,6 +454,7 @@ export class AiService {
   constructor(
     private readonly configService: ConfigService,
     @Optional() @InjectModel(CatalogImage.name, GLOBAL_DB_CONNECTION) private readonly imageModel?: Model<CatalogImageDocument>,
+    @Optional() private readonly grounding?: PlaceGroundingService,
   ) {
     const geminiKey = this.configService.get<string>('GEMINI_API_KEY');
     if (geminiKey) {
@@ -509,26 +507,106 @@ export class AiService {
    * (même appel IA : aucun coût supplémentaire). Les pépites peuvent être vides.
    */
   async generatePoisAndGems(dto: GenerateTripDto): Promise<{ pois: POI[]; gems: TripGem[] }> {
+    // 0. Ancrage dans le réel : lieux réels de la destination donnés à l'IA, puis vérifiés
+    const cityCoords = await this.resolveDestinationCoordinates(dto.destination);
+    const scope = this.grounding ? await this.grounding.scope(dto.destination, cityCoords) : null;
+    const places = scope ? await this.grounding!.candidates(scope).catch(() => [] as GroundedPlace[]) : [];
+    const groundingText = this.grounding?.promptContext(places) ?? '';
+
+    let result: { pois: POI[]; gems: TripGem[] } | null = null;
     // 1. Claude, uniquement si AI_PROVIDER=claude (client non créé sinon)
     if (this.anthropic) {
       try {
-        return await this.generateWithClaude(dto);
+        result = await this.generateWithClaude(dto, cityCoords, groundingText);
       } catch (err) {
         this.logger.warn(`Claude generation error: ${err.message}. Falling back to Gemini AI...`);
       }
     }
 
     // 2. Try Gemini AI (Gemini Flash & Pro models with automatic cascade)
-    if (this.genAI) {
+    if (!result && this.genAI) {
       try {
-        return await this.generateWithGemini(dto);
+        result = await this.generateWithGemini(dto, cityCoords, groundingText);
       } catch (err) {
         this.logger.warn(`Gemini generation error: ${err.message}. Using dynamic real-venue engine...`);
       }
     }
 
     // 3. Fallback to dynamic real-venue generation (sans pépites)
-    return { pois: await this.generateDynamicPois(dto), gems: [] };
+    if (!result) result = { pois: await this.generateDynamicPois(dto), gems: [] };
+
+    return scope ? this.groundItinerary(result, dto, scope, places) : result;
+  }
+
+  /**
+   * Rien d'inventé : chaque lieu et chaque pépite est vérifié (vraies coordonnées), les introuvables sont
+   * retirés et remplacés par des lieux réels proches, et chaque image est celle du lieu lui-même.
+   */
+  private async groundItinerary(
+    result: { pois: POI[]; gems: TripGem[] },
+    dto: GenerateTripDto,
+    scope: GroundingScope,
+    places: GroundedPlace[],
+  ): Promise<{ pois: POI[]; gems: TripGem[] }> {
+    const g = this.grounding!;
+    try {
+      const { kept, dropped } = await g.verify(result.pois, scope, places);
+      // Aucune note ni nombre d'avis inventé (y compris dans les lieux de secours)
+      const pois: any[] = kept.map((p: any) => ({ ...p, rating: undefined, reviews_count: undefined }));
+
+      // Remplaçants réels pour les lieux retirés, au même créneau, près des autres lieux du jour
+      const replacements: any[] = [];
+      for (const d of dropped as any[]) {
+        const sameDay = pois.filter((p) => p.day === d.day);
+        const near = sameDay.length
+          ? { lat: sameDay.reduce((s, p) => s + p.lat, 0) / sameDay.length, lng: sameDay.reduce((s, p) => s + p.lng, 0) / sameDay.length }
+          : scope.center;
+        const used = [...pois, ...replacements].map((p) => p.name);
+        const pick = g.replacements(places, used, near, d.order === 2, 1)[0];
+        if (!pick) continue;
+        replacements.push({
+          ...d,
+          name: pick.name,
+          lat: pick.lat,
+          lng: pick.lng,
+          image_query: pick.name,
+          image_url: null,
+          description: '',
+          insider_tip: '',
+          hidden_gem: false,
+          category: pick.food ? d.category : d.category,
+          verified: true,
+          source: pick.source,
+          ...(pick.wiki ? { wiki: pick.wiki } : {}),
+        });
+      }
+      if (replacements.length) {
+        // Description tirée de Wikipédia, sinon neutre : jamais inventée
+        const extracts = await g.extracts(replacements.filter((r) => r.wiki).map((r) => r.wiki));
+        for (const r of replacements) {
+          r.description =
+            (r.wiki && extracts.get(`${r.wiki.lang}:${r.wiki.title}`)) ||
+            `Lieu référencé sur la carte de ${scope.destination.split(',')[0]} : vérifie les horaires avant d'y aller.`;
+        }
+        pois.push(...replacements);
+        this.logger.log(`${scope.destination} : ${replacements.length} lieu(x) remplacé(s) par des lieux réels`);
+      }
+      pois.sort((a, b) => a.day - b.day || a.order - b.order);
+
+      const gemCheck = await g.verify(result.gems as any[], scope, places);
+      const gems: any[] = gemCheck.kept;
+
+      // Images du lieu lui-même (article Wikipédia, sinon photo géolocalisée sur place), sinon aucune
+      await Promise.all(
+        [...pois, ...gems].map(async (p) => {
+          p.image_url = p.verified ? await g.imageFor(p).catch(() => null) : null;
+        }),
+      );
+      return { pois, gems };
+    } catch (err: any) {
+      this.logger.warn(`Vérification des lieux de ${scope.destination} impossible : ${err.message}`);
+      return result;
+    }
   }
 
   /**
@@ -1285,7 +1363,7 @@ ${rules.map((r) => `  • ${r}`).join('\n')}`;
     return dto.duration_days * this.activitiesPerDay(dto);
   }
 
-  private buildOptimizedTripPrompt(dto: GenerateTripDto, cityCoords: { lat: number; lng: number }): string {
+  private buildOptimizedTripPrompt(dto: GenerateTripDto, cityCoords: { lat: number; lng: number }, groundingText = ''): string {
     const activitiesPerDay = this.activitiesPerDay(dto);
     const totalPoisCount = this.expectedPoiCount(dto);
 
@@ -1389,28 +1467,32 @@ Conçois un itinéraire authentique, géographiquement optimisé et mémorable.
 - Rythme : ${paceDetails}
 - Déplacements : ${transports}
 - Budget : ${dto.budget} (adapte le standing des adresses)${this.budgetContext(dto)}
-- Sensibilité thermique : ${this.getThermalSensitivityNote(dto.thermal_sensitivity)}${travelersContext}${tribeContext}${gemsSection}
+- Sensibilité thermique : ${this.getThermalSensitivityNote(dto.thermal_sensitivity)}${travelersContext}${tribeContext}${gemsSection}${groundingText}
 
 ## RÈGLES
 1. VOLUME : exactement ${activitiesPerDay} lieux par jour, soit ${totalPoisCount} au total. Créneaux "order" : ${orderSlots}. Le lieu order 2 est un restaurant ou une adresse gourmande.
 2. ZÉRO DOUBLON : aucun lieu ne doit apparaître deux fois sur l'ensemble du séjour. Chaque jour compte exactement 1 pépite secrète ("hidden_gem": true) : un lieu réel aimé des habitants, peu connu des touristes ; false pour tous les autres.
 3. MONUMENT D'OUVERTURE : le lieu jour 1 / order 1 est LE monument ou l'édifice emblématique majeur de la destination (ex : Parthénon pour Athènes, Colisée pour Rome, Basilique de Yamoussoukro pour la Côte d'Ivoire). Son "image_query" est son nom universel (ex : "Parthenon Athens").
-4. LIEUX RÉELS UNIQUEMENT : de vrais monuments, musées, restaurants, marchés ou pépites existant réellement à ${dto.destination}. Aucun nom générique ou inventé ; en cas de doute, choisis un lieu plus connu. "name" = nom officiel exact, tel qu'affiché sur Google Maps (sans ville ni description ajoutée).
+4. LIEUX RÉELS UNIQUEMENT, ZÉRO INVENTION : chaque lieu existe réellement à ${dto.destination} et se retrouve sur une carte. N'invente JAMAIS un nom, un restaurant, un musée ou une adresse ; si tu n'es pas certain qu'un lieu existe, NE LE PROPOSE PAS et choisis un lieu notoire (monument, musée national, grand marché, cathédrale ou grande mosquée, plage, parc). C'est encore plus vrai pour les destinations moins documentées (Afrique, petites villes) : reste sur des lieux connus et vérifiables. "name" = nom officiel exact, tel qu'affiché sur Google Maps (sans ville ni description ajoutée). Les descriptions ne contiennent que des faits sûrs : pas de date, de chiffre ou d'anecdote dont tu doutes.
 5. GPS EXACTS : "lat"/"lng" réels de l'entrée principale du lieu (5 décimales), jamais le centre-ville par défaut.
 6. UN QUARTIER PAR JOUR : les lieux d'une même journée tiennent dans un rayon de ${dayRadius} et s'enchaînent sans retour en arrière (${transports}). Varie les ambiances d'un jour à l'autre : centre historique, quartiers artistiques et musées, nature et panoramas, vie locale et marchés.
 7. PERSONNALISATION : au moins 70 % des lieux correspondent aux centres d'intérêt (${interests}). "category" reprend le centre d'intérêt correspondant.
 8. TEXTES COURTS ET UTILES (en français) :
    - "description" : 2 phrases maximum (40 mots), immersives et concrètes.
    - "insider_tip" : 1 phrase (25 mots max), conseil exclusif et actionnable : plat ou boisson à commander, meilleur créneau anti-foule, spot photo, ou tenue adaptée à la météo et à la sensibilité thermique.
-9. RÉALISME : "duration_minutes" = durée réelle de visite (30 à 180) ; une journée, visites et trajets compris, tient entre 9h et ${dayEnd}. "rating" entre 4.4 et 4.9, "reviews_count" entre 850 et 28000.
+9. RÉALISME : "duration_minutes" = durée réelle de visite (30 à 180) ; une journée, visites et trajets compris, tient entre 9h et ${dayEnd}.
 
 ## FORMAT
 Réponds avec UNIQUEMENT un objet JSON compact (sans markdown, sans texte autour), trié par jour puis par order :
-{"pois":[{"name":"Nom officiel du lieu","description":"...","lat":0.00000,"lng":0.00000,"day":1,"order":1,"duration_minutes":90,"category":"culture","image_query":"English landmark name","rating":4.8,"reviews_count":3200,"insider_tip":"...","hidden_gem":false}]${gemsFormat}}
+{"pois":[{"name":"Nom officiel du lieu","description":"...","lat":0.00000,"lng":0.00000,"day":1,"order":1,"duration_minutes":90,"category":"culture","image_query":"English landmark name","insider_tip":"...","hidden_gem":false}]${gemsFormat}}
 Avant de répondre, vérifie : ${totalPoisCount} lieux, ${activitiesPerDay} par jour, 1 pépite par jour, aucun doublon, coordonnées propres à chaque lieu.`;
   }
 
-  private async generateWithGemini(dto: GenerateTripDto): Promise<{ pois: POI[]; gems: TripGem[] }> {
+  private async generateWithGemini(
+    dto: GenerateTripDto,
+    cityCoords: { lat: number; lng: number },
+    groundingText = '',
+  ): Promise<{ pois: POI[]; gems: TripGem[] }> {
     const modelsToTry = [
       'gemini-3.5-flash-lite',
       'gemini-3.5-flash',
@@ -1421,8 +1503,7 @@ Avant de répondre, vérifie : ${totalPoisCount} lieux, ${activitiesPerDay} par 
       'gemini-pro-latest',
     ];
 
-    const cityCoords = await this.resolveDestinationCoordinates(dto.destination);
-    const prompt = this.buildOptimizedTripPrompt(dto, cityCoords);
+    const prompt = this.buildOptimizedTripPrompt(dto, cityCoords, groundingText);
 
     for (const modelName of modelsToTry) {
       try {
@@ -1458,9 +1539,12 @@ Avant de répondre, vérifie : ${totalPoisCount} lieux, ${activitiesPerDay} par 
     throw new Error('All Gemini models failed to produce valid POIs');
   }
 
-  private async generateWithClaude(dto: GenerateTripDto): Promise<{ pois: POI[]; gems: TripGem[] }> {
-    const cityCoords = await this.resolveDestinationCoordinates(dto.destination);
-    const prompt = this.buildOptimizedTripPrompt(dto, cityCoords);
+  private async generateWithClaude(
+    dto: GenerateTripDto,
+    cityCoords: { lat: number; lng: number },
+    groundingText = '',
+  ): Promise<{ pois: POI[]; gems: TripGem[] }> {
+    const prompt = this.buildOptimizedTripPrompt(dto, cityCoords, groundingText);
 
     const activitiesPerDay = dto.pace === 'tranquille' ? 3 : dto.pace === 'intensif' ? 5 : 4;
     const expectedPois = dto.duration_days * activitiesPerDay;
@@ -1559,8 +1643,9 @@ Avant de répondre, vérifie : ${totalPoisCount} lieux, ${activitiesPerDay} par 
         category: cat,
         image_query: p.image_query || p.name || dto.destination,
         image_url: p.image_url || null,
-        rating: typeof p.rating === 'number' ? p.rating : 4.8,
-        reviews_count: typeof p.reviews_count === 'number' ? p.reviews_count : 2400,
+        // Aucune note inventée : seules les notes des voyageurs Voyagooo sont affichées
+        rating: undefined,
+        reviews_count: undefined,
         insider_tip: p.insider_tip || `Conseil Voyago : arrivez tôt le matin pour savourer le lieu au calme.`,
         hidden_gem: p.hidden_gem === true,
       };
@@ -1939,6 +2024,11 @@ Réponds STRICTEMENT en JSON :
   async fetchWikipediaImage(imageQuery: string, fallbackUrl?: string): Promise<string | null> {
     const found = await this.catalogImage(imageQuery);
     return found || fallbackUrl || this.getCuratedPhoto('culture', imageQuery);
+  }
+
+  /** Image trouvée pour cette recherche, ou null : jamais d'image générique de remplacement */
+  findImage(query: string): Promise<string | null> {
+    return this.catalogImage(query);
   }
 
   private async catalogImage(query: string): Promise<string | null> {

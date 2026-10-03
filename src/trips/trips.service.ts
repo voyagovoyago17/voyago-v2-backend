@@ -8,6 +8,7 @@ import {
 } from '@nestjs/common';
 import { TripScheduleService } from './trip-schedule.service';
 import { TripBookingsService } from './trip-bookings.service';
+import { nameSimilarity } from '../ai/place-grounding.service';
 import { UpdateTripDatesDto } from './dto/update-trip-dates.dto';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
@@ -419,7 +420,13 @@ export class TripsService {
 
     const [poisWithImages, weather] = await Promise.all([
       Promise.all(
-        rawPois.map(async (poi, idx) => {
+        rawPois.map(async (poi: any, idx) => {
+          // Lieux vérifiés : l'image est celle du lieu lui-même, sinon aucune (jamais celle d'un autre lieu)
+          if (poi.verified !== undefined) {
+            if (poi.image_url) return poi;
+            const isMonument = idx === 0 && nameSimilarity(poi.name, monument.monumentName) >= 0.6;
+            return { ...poi, image_url: isMonument ? monument.imageUrl : null };
+          }
           // Jour 1, Premier lieu : Toujours le monument / édifice emblématique résolu
           if (idx === 0) {
             return { ...poi, image_url: monument.imageUrl };
@@ -439,9 +446,9 @@ export class TripsService {
           let imageUrl = poi.image_url;
           if (!imageUrl || isStaticPlaceholder) {
             const query = poi.image_query || `${poi.name} ${dto.destination}`;
-            imageUrl = await this.aiService.fetchWikipediaImage(query, monument.imageUrl);
+            imageUrl = await this.aiService.findImage(query);
           }
-          return { ...poi, image_url: imageUrl || monument.imageUrl };
+          return { ...poi, image_url: imageUrl || null };
         }),
       ),
       options.withWeather
@@ -451,9 +458,11 @@ export class TripsService {
 
     // Photos des pépites (Wikimedia, gratuit) en parallèle, sans bloquer si une échoue
     const gems = await Promise.all(
-      rawGems.map(async (g) => ({
+      rawGems.map(async (g: any) => ({
         ...g,
-        image_url: await this.aiService.fetchWikipediaImage(g.image_query, undefined).catch(() => null),
+        // Pépite vérifiée : image déjà trouvée sur place (ou aucune) ; sinon recherche, sans image générique
+        image_url:
+          g.verified !== undefined ? g.image_url ?? null : await this.aiService.findImage(g.image_query).catch(() => null),
       })),
     );
 

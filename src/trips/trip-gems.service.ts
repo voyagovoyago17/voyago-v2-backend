@@ -133,7 +133,7 @@ export class TripGemsService {
     const gems = await Promise.all(
       generated.map(async (g) => ({
         ...g,
-        image_url: await this.aiService.fetchWikipediaImage(g.image_query, undefined).catch(() => null),
+        image_url: await this.aiService.findImage(g.image_query).catch(() => null),
       })),
     );
     if (gems.length) {
