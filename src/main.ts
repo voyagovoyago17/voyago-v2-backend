@@ -181,22 +181,25 @@ async function bootstrap() {
       const sdkAdb = process.env.LOCALAPPDATA
         ? `"${process.env.LOCALAPPDATA}\\Android\\Sdk\\platform-tools\\adb.exe"`
         : 'adb';
-      // Tente d'abord le chemin Android SDK, sinon le adb global
-      exec(`${sdkAdb} reverse tcp:${port} tcp:${port}`, (err) => {
-        if (!err) {
+
+      exec(`${sdkAdb} devices`, (err, stdout) => {
+        const out = !err && stdout ? stdout : '';
+        const lines = out.split('\n');
+        const devices = lines
+          .map((l) => l.trim().split(/\s+/))
+          .filter((p) => p.length >= 2 && p[1] === 'device')
+          .map((p) => p[0]);
+
+        if (devices.length > 0) {
+          for (const dev of devices) {
+            exec(`${sdkAdb} -s ${dev} reverse tcp:${port} tcp:${port}`);
+          }
           if (!lastAdbStatus) {
-            logger.log(`📱 ADB Reverse actif : port ${port} redirigé vers le smartphone USB`);
+            logger.log(`📱 ADB Reverse actif pour ${devices.length} appareil(s)/émulateur(s) : [${devices.join(', ')}]`);
             lastAdbStatus = true;
           }
         } else {
-          exec(`adb reverse tcp:${port} tcp:${port}`, (err2) => {
-            if (!err2 && !lastAdbStatus) {
-              logger.log(`📱 ADB Reverse actif : port ${port} redirigé vers le smartphone USB`);
-              lastAdbStatus = true;
-            } else if (err2) {
-              lastAdbStatus = false;
-            }
-          });
+          lastAdbStatus = false;
         }
       });
     };
