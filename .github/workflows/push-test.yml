@@ -60,6 +60,8 @@ jobs:
                 process.exit(1);
               }
               console.log('FCM actif :', r.push_enabled, '| appareils enregistrés :', r.devices, '| envoyés :', r.sent, '| échecs :', r.failed);
+              for (const d of r.device_list || []) console.log('  appareil', d.platform, '…' + d.token_end, '| vu le', d.last_seen_at);
+              for (const x of r.results || []) console.log('  envoi …' + x.token_end, x.ok ? 'OK id=' + x.message_id : 'ÉCHEC ' + x.error);
               if (!r.devices) console.log('→ Aucun appareil : connecte-toi avec ce compte dans l\'app (notifications acceptées), puis relance ce test.');
               await fetch(api + '/auth/logout', { method: 'POST', headers: { Authorization: 'Bearer ' + auth.body.session_token } }).catch(() => {});
             })();

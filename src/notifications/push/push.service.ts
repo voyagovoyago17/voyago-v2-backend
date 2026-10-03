@@ -125,8 +125,19 @@ export class PushService implements OnModuleInit {
     return this.deviceModel.countDocuments({ user_id: userId }).exec();
   }
 
+  /** Appareils d'un compte, sans le jeton complet (diagnostic). */
+  async describeDevices(userId: string) {
+    const devices = await this.deviceModel.find({ user_id: userId }).sort({ last_seen_at: -1 }).lean().exec();
+    return devices.map((d) => ({
+      platform: d.platform,
+      token_end: d.token.slice(-8),
+      app_version: d.app_version || null,
+      last_seen_at: d.last_seen_at,
+    }));
+  }
+
   /** Envoie une notification push à tous les appareils d'un utilisateur. Ne lève jamais d'erreur. */
-  async sendToUser(userId: string, message: PushMessage): Promise<{ sent: number; failed: number }> {
+  async sendToUser(userId: string, message: PushMessage): Promise<{ sent: number; failed: number; results?: any[] }> {
     if (!this.messaging) return { sent: 0, failed: 0 };
     const devices = await this.deviceModel.find({ user_id: userId }).select('token').lean().exec();
     if (!devices.length) return { sent: 0, failed: 0 };
@@ -163,7 +174,13 @@ export class PushService implements OnModuleInit {
       if (dead.length) {
         await this.deviceModel.deleteMany({ token: { $in: dead } }).exec();
       }
-      return { sent: res.successCount, failed: res.failureCount };
+      const results = res.responses.map((r, i) => ({
+        token_end: tokens[i].slice(-8),
+        ok: r.success,
+        message_id: r.messageId?.split('/').pop() || null,
+        error: r.error ? `${r.error.code}: ${r.error.message}` : null,
+      }));
+      return { sent: res.successCount, failed: res.failureCount, results };
     } catch (err: any) {
       this.logger.warn(`Push en échec pour ${userId}: ${err.message}`);
       return { sent: 0, failed: tokens.length };

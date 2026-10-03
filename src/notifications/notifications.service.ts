@@ -125,13 +125,14 @@ export class NotificationsService implements OnModuleInit {
       read: false,
     });
     const n = this.toDto(doc.toObject());
-    const devices = await this.pushService.deviceCount(userId);
+    const deviceList = await this.pushService.describeDevices(userId);
+    const devices = deviceList.length;
     const push = await this.pushService.sendToUser(userId, {
       title: n.title,
       body: n.body,
       data: { notification_id: n.id, type: n.type, payload: n.data },
     });
-    return { notification: n, push_enabled: this.pushService.enabled, devices, ...push };
+    return { notification: n, push_enabled: this.pushService.enabled, devices, device_list: deviceList, ...push };
   }
 
   async list(userId: string, limit = 30): Promise<{ notifications: any[]; unread_count: number }> {
