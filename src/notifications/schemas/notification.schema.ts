@@ -41,4 +41,11 @@ export const NotificationSchema = SchemaFactory.createForClass(Notification);
 
 NotificationSchema.index({ user_id: 1, created_at: -1 });
 NotificationSchema.index({ user_id: 1, read: 1 });
-NotificationSchema.index({ user_id: 1, dedupe_key: 1 }, { unique: true, sparse: true });
+// Unicité seulement pour les notifications qui ont une clé d'idempotence.
+// (« sparse » ne suffit pas sur un index composé : user_id présent => dedupe_key null indexé,
+// ce qui bloquait toute 2e notification sans clé pour un même utilisateur.)
+export const DEDUPE_INDEX_NAME = 'user_id_dedupe_key_unique';
+NotificationSchema.index(
+  { user_id: 1, dedupe_key: 1 },
+  { name: DEDUPE_INDEX_NAME, unique: true, partialFilterExpression: { dedupe_key: { $type: 'string' } } },
+);

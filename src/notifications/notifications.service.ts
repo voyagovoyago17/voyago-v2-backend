@@ -1,8 +1,8 @@
-import { Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException, OnModuleInit } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import { v4 as uuidv4 } from 'uuid';
-import { Notification, NotificationDocument, NotificationType } from './schemas/notification.schema';
+import { DEDUPE_INDEX_NAME, Notification, NotificationDocument, NotificationType } from './schemas/notification.schema';
 import { ArrivalDto } from './dto/arrival.dto';
 import { placeKey } from '../places/place-key';
 import { GLOBAL_DB_CONNECTION } from '../common/constants';
@@ -20,7 +20,7 @@ export interface CreateNotificationInput {
 }
 
 @Injectable()
-export class NotificationsService {
+export class NotificationsService implements OnModuleInit {
   private readonly logger = new Logger(NotificationsService.name);
 
   constructor(
@@ -28,6 +28,29 @@ export class NotificationsService {
     private readonly notificationModel: Model<NotificationDocument>,
     private readonly pushService: PushService,
   ) {}
+
+  /**
+   * Remplace l'ancien index unique « sparse » (user_id, dedupe_key), qui n'autorisait
+   * qu'une seule notification sans clé par utilisateur, par l'index partiel du schéma.
+   */
+  async onModuleInit() {
+    try {
+      const indexes = await this.notificationModel.collection.indexes();
+      const legacy = indexes.find((i) => i.name === 'user_id_1_dedupe_key_1');
+      if (legacy) {
+        await this.notificationModel.collection.dropIndex('user_id_1_dedupe_key_1');
+        this.logger.log('Ancien index unique des notifications supprimé');
+      }
+      if (!indexes.some((i) => i.name === DEDUPE_INDEX_NAME)) {
+        await this.notificationModel.collection.createIndex(
+          { user_id: 1, dedupe_key: 1 },
+          { name: DEDUPE_INDEX_NAME, unique: true, partialFilterExpression: { dedupe_key: { $type: 'string' } } },
+        );
+      }
+    } catch (err: any) {
+      this.logger.warn(`Index des notifications non migré : ${err.message}`);
+    }
+  }
 
   /** Crée une notification ; avec dedupe_key, renvoie l'existante au lieu d'un doublon. */
   async create(userId: string, input: CreateNotificationInput): Promise<any> {
