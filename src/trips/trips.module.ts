@@ -4,6 +4,7 @@ import { TripsController } from './trips.controller';
 import { TripsService } from './trips.service';
 import { TripGemsService } from './trip-gems.service';
 import { TripScheduleService } from './trip-schedule.service';
+import { TripPackingService } from './trip-packing.service';
 import { TripSchedule, TripScheduleSchema } from './schemas/trip-schedule.schema';
 import { Trip, TripSchema } from './schemas/trip.schema';
 import { CommunityMember, CommunityMemberSchema } from '../community/schemas/community-member.schema';
@@ -47,7 +48,7 @@ import { GLOBAL_DB_CONNECTION, TENANT_DB_CONNECTION } from '../common/constants'
     GamificationModule,
   ],
   controllers: [TripsController],
-  providers: [TripsService, TripGemsService, TripScheduleService, SessionAuthGuard, OptionalSessionAuthGuard],
+  providers: [TripsService, TripGemsService, TripScheduleService, TripPackingService, SessionAuthGuard, OptionalSessionAuthGuard],
   exports: [
     TripsService,
     TripScheduleService,

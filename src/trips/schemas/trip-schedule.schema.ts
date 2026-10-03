@@ -22,6 +22,18 @@ export class TripSchedule {
   @Prop({ type: Date, required: true })
   end_date: Date;
 
+  /** Premier jour du voyage (minuit UTC) : rappel de la veille et récap du soir */
+  @Prop({ type: Date, default: null })
+  start_date: Date | null;
+
+  /** Rappel « départ demain » déjà envoyé */
+  @Prop({ type: Date, default: null })
+  departure_notified_at: Date | null;
+
+  /** Dernier récap du soir envoyé (AAAA-MM-JJ) */
+  @Prop({ type: String, default: null })
+  last_recap_on: string | null;
+
   /** Clôture automatique déjà traitée (journal + notification) */
   @Prop({ type: Date, default: null })
   processed_at: Date | null;
@@ -29,3 +41,4 @@ export class TripSchedule {
 
 export const TripScheduleSchema = SchemaFactory.createForClass(TripSchedule);
 TripScheduleSchema.index({ processed_at: 1, end_date: 1 });
+TripScheduleSchema.index({ departure_notified_at: 1, start_date: 1 });

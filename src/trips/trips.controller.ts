@@ -3,6 +3,7 @@ import {
   Get,
   Post,
   Patch,
+  Delete,
   Body,
   Param,
   UseGuards,
@@ -18,6 +19,8 @@ import { RemixTripDto } from './dto/remix-trip.dto';
 import { CollectGemDto } from './dto/collect-gem.dto';
 import { TripGemsService } from './trip-gems.service';
 import { UpdateTripDatesDto } from './dto/update-trip-dates.dto';
+import { TripPackingService } from './trip-packing.service';
+import { AddPackingItemDto, TogglePackingItemDto } from './dto/packing.dto';
 
 @ApiTags('✈️ Voyages & Itinéraires IA')
 @Controller()
@@ -25,6 +28,7 @@ export class TripsController {
   constructor(
     private readonly tripsService: TripsService,
     private readonly tripGemsService: TripGemsService,
+    private readonly tripPackingService: TripPackingService,
   ) {}
 
   @ApiOperation({ summary: 'Obtenir tous les voyages d’un utilisateur (privés et/ou publics)' })
@@ -47,6 +51,38 @@ export class TripsController {
     // Authenticated owners are looked up in their tenant DB first;
     // otherwise the public lookup falls through to the shared DB
     return this.tripsService.getTripById(trip_id, user?.user_id);
+  }
+
+  /** Valise : liste sur mesure (générée au premier appel) et objets cochés */
+  @ApiOperation({ summary: 'Valise du voyage : liste à préparer générée par l’IA' })
+  @ApiBearerAuth()
+  @Get('trip/:trip_id/packing')
+  @UseGuards(SessionAuthGuard)
+  async getPacking(@CurrentUser() user: any, @Param('trip_id') trip_id: string) {
+    return this.tripPackingService.get(user.user_id, trip_id);
+  }
+
+  @Patch('trip/:trip_id/packing/items/:item_id')
+  @UseGuards(SessionAuthGuard)
+  async togglePackingItem(
+    @CurrentUser() user: any,
+    @Param('trip_id') trip_id: string,
+    @Param('item_id') item_id: string,
+    @Body() dto: TogglePackingItemDto,
+  ) {
+    return this.tripPackingService.toggle(user.user_id, trip_id, item_id, dto.packed);
+  }
+
+  @Post('trip/:trip_id/packing/items')
+  @UseGuards(SessionAuthGuard)
+  async addPackingItem(@CurrentUser() user: any, @Param('trip_id') trip_id: string, @Body() dto: AddPackingItemDto) {
+    return this.tripPackingService.addItem(user.user_id, trip_id, dto.label, dto.category);
+  }
+
+  @Delete('trip/:trip_id/packing/items/:item_id')
+  @UseGuards(SessionAuthGuard)
+  async removePackingItem(@CurrentUser() user: any, @Param('trip_id') trip_id: string, @Param('item_id') item_id: string) {
+    return this.tripPackingService.removeItem(user.user_id, trip_id, item_id);
   }
 
   /** Ajouter ou changer les dates d'un voyage (la fin découle de la durée) */

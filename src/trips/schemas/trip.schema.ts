@@ -128,6 +128,10 @@ export class Trip {
   @Prop({ type: Date, default: null })
   completed_at?: Date | null;
 
+  /** Valise : liste à préparer (générée par l'IA, cochée par le voyageur) */
+  @Prop({ type: Object, default: null })
+  packing_list?: Record<string, any> | null;
+
   /** Journal partagé à la communauté (XP attribuée une seule fois) */
   @Prop({ type: Date, default: null })
   journal_shared_at?: Date | null;

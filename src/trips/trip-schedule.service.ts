@@ -33,6 +33,7 @@ export class TripScheduleService {
               user_id: userId,
               destination: trip.destination || '',
               end_date: end,
+              start_date: trip.start_date ? new Date(`${String(trip.start_date).slice(0, 10)}T00:00:00Z`) : null,
               // Voyage déjà terminé à la main : rien à faire
               ...(trip.completed_at ? { processed_at: new Date(trip.completed_at) } : {}),
             },
@@ -48,7 +49,10 @@ export class TripScheduleService {
 
   /** Dates modifiées : le voyage sera de nouveau clôturé automatiquement à sa nouvelle fin. */
   async reset(userId: string, trip: any): Promise<void> {
-    await this.scheduleModel.updateOne({ trip_id: trip.id }, { $set: { processed_at: null } }).exec().catch(() => undefined);
+    await this.scheduleModel
+      .updateOne({ trip_id: trip.id }, { $set: { processed_at: null, departure_notified_at: null, last_recap_on: null } })
+      .exec()
+      .catch(() => undefined);
     await this.register(userId, trip);
   }
 
@@ -57,10 +61,15 @@ export class TripScheduleService {
     const dated = trips.filter((t) => !t.completed_at && tripEndDate(t));
     if (!dated.length) return;
     (async () => {
+      // Déjà connus et à jour (date de début enregistrée) : rien à faire
       const known = new Set(
-        (await this.scheduleModel.find({ trip_id: { $in: dated.map((t) => t.id) } }).select('trip_id').lean().exec()).map(
-          (s: any) => s.trip_id,
-        ),
+        (
+          await this.scheduleModel
+            .find({ trip_id: { $in: dated.map((t) => t.id) }, $or: [{ start_date: { $ne: null } }, { processed_at: { $ne: null } }] })
+            .select('trip_id')
+            .lean()
+            .exec()
+        ).map((s: any) => s.trip_id),
       );
       for (const t of dated) {
         if (!known.has(t.id)) await this.register(userId, t);
@@ -76,6 +85,38 @@ export class TripScheduleService {
       .limit(limit)
       .lean()
       .exec();
+  }
+
+  /** Départ demain (ou dans les prochaines heures) : rappel pas encore envoyé. */
+  departuresDue(limit = 200) {
+    const now = Date.now();
+    return this.scheduleModel
+      .find({
+        processed_at: null,
+        departure_notified_at: null,
+        start_date: { $gt: new Date(now - 12 * 3600 * 1000), $lte: new Date(now + 30 * 3600 * 1000) },
+      })
+      .limit(limit)
+      .lean()
+      .exec();
+  }
+
+  /** Voyages en cours aujourd'hui (UTC) dont le récap du soir n'a pas été envoyé. */
+  ongoing(today: string, limit = 500) {
+    const day = new Date(`${today}T00:00:00Z`);
+    return this.scheduleModel
+      .find({ processed_at: null, start_date: { $lte: day }, end_date: { $gte: day }, last_recap_on: { $ne: today } })
+      .limit(limit)
+      .lean()
+      .exec();
+  }
+
+  markDepartureNotified(tripId: string) {
+    return this.scheduleModel.updateOne({ trip_id: tripId }, { $set: { departure_notified_at: new Date() } }).exec();
+  }
+
+  markRecapSent(tripId: string, today: string) {
+    return this.scheduleModel.updateOne({ trip_id: tripId }, { $set: { last_recap_on: today } }).exec();
   }
 
   markProcessed(tripId: string) {

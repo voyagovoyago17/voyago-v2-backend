@@ -37,6 +37,8 @@ const XP_ACTIONS: Record<string, number> = {
   // Fondateurs de tribus
   fondateur_reactif: 1,
   fondateur_actif: 1,
+  // Valise complète avant le départ
+  valise_prete: 1,
 };
 
 /** Actions attribuées uniquement par le serveur (jamais via POST /profile/xp). */
@@ -59,6 +61,7 @@ export const SERVER_ONLY_XP_ACTIONS = [
   'compte_verifie',
   'fondateur_reactif',
   'fondateur_actif',
+  'valise_prete',
 ];
 
 const ONE_TIME_ACTIONS = [

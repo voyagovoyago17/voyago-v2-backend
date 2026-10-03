@@ -103,6 +103,61 @@ const CLAUDE_MODELS: { id: string; effort?: 'low' | 'medium' | 'high'; extraToke
 const TOKENS_PER_POI = 350;
 /** ~120 tokens par pépite (nom, accroche, coordonnées) */
 const TOKENS_PER_GEM = 120;
+
+/** Catégories de la valise (l'app associe une icône 3D à chacune) */
+export const PACKING_CATEGORIES = [
+  'documents',
+  'argent',
+  'vetements',
+  'chaussures',
+  'hygiene',
+  'sante',
+  'electronique',
+  'meteo',
+  'activites',
+  'divers',
+] as const;
+
+export interface PackingItemDraft {
+  label: string;
+  essential: boolean;
+  reason?: string;
+}
+export interface PackingCategoryDraft {
+  key: (typeof PACKING_CATEGORIES)[number];
+  title: string;
+  items: PackingItemDraft[];
+}
+
+const PACKING_RESPONSE_SCHEMA: ResponseSchema = {
+  type: SchemaType.OBJECT,
+  properties: {
+    categories: {
+      type: SchemaType.ARRAY,
+      items: {
+        type: SchemaType.OBJECT,
+        properties: {
+          key: { type: SchemaType.STRING, format: 'enum', enum: [...PACKING_CATEGORIES] },
+          title: { type: SchemaType.STRING },
+          items: {
+            type: SchemaType.ARRAY,
+            items: {
+              type: SchemaType.OBJECT,
+              properties: {
+                label: { type: SchemaType.STRING },
+                essential: { type: SchemaType.BOOLEAN },
+                reason: { type: SchemaType.STRING },
+              },
+              required: ['label', 'essential'],
+            },
+          },
+        },
+        required: ['key', 'title', 'items'],
+      },
+    },
+  },
+  required: ['categories'],
+};
 const CLAUDE_MAX_OUTPUT = 64000;
 
 /** Schéma imposé à Claude (structured outputs) : JSON toujours valide et complet. */
@@ -349,6 +404,163 @@ Réponds avec UNIQUEMENT un objet JSON compact : {"gems":[{"name":"...","teaser"
       }
     }
     return [];
+  }
+
+  /**
+   * Valise sur mesure : quoi emporter pour CE voyage (climat, durée, activités, transports, pays).
+   * Repli sur une liste de base si l'IA ne répond pas.
+   */
+  async generatePackingList(trip: {
+    destination: string;
+    country?: string;
+    duration_days: number;
+    start_date?: string;
+    pace?: string;
+    budget?: string;
+    transports?: string[];
+    interests?: string[];
+    weather?: DayWeather[];
+    pois?: POI[];
+  }): Promise<PackingCategoryDraft[]> {
+    const days = Math.max(1, trip.duration_days || 1);
+    const w = (trip.weather || []).filter((d: any) => d && (d.temp_max != null || d.temp_min != null));
+    const maxT = w.length ? Math.max(...w.map((d: any) => Number(d.temp_max ?? d.temp_min))) : null;
+    const minT = w.length ? Math.min(...w.map((d: any) => Number(d.temp_min ?? d.temp_max))) : null;
+    // Codes WMO de pluie / averses / orages (51-67, 80-82, 95-99), ou résumé explicite
+    const rainy = w.filter((d: any) => {
+      const code = Number(d.weather_code);
+      return (code >= 51 && code <= 67) || (code >= 80 && code <= 82) || code >= 95 || /pluie|averse|orage/i.test(d.summary ?? '');
+    }).length;
+    const climate = w.length
+      ? `Météo prévue : de ${Math.round(minT!)}°C à ${Math.round(maxT!)}°C, ${rainy} jour(s) de pluie sur ${w.length}.`
+      : 'Météo inconnue : adapte à la saison et au climat habituel de la destination.';
+    const when = trip.start_date
+      ? `Départ le ${new Date(trip.start_date).toLocaleDateString('fr-FR', { day: 'numeric', month: 'long', year: 'numeric' })}.`
+      : 'Dates non précisées.';
+    const categories = [...new Set((trip.pois || []).map((p: any) => p.category).filter(Boolean))].slice(0, 12).join(', ');
+
+    const prompt = `Tu es Voyago, expert en préparation de voyage. Prépare la valise idéale, ni trop ni trop peu.
+Voyage : ${trip.destination}${trip.country ? ` (${trip.country})` : ''}, ${days} jour(s). ${when}
+${climate}
+Rythme : ${trip.pace || 'equilibre'} · Budget : ${trip.budget || 'moyen'} · Transports : ${(trip.transports || []).join(', ') || 'marche'}
+Centres d'intérêt : ${(trip.interests || []).join(', ') || 'découverte'}${categories ? ` · Lieux prévus : ${categories}` : ''}
+
+Règles :
+- 25 à 40 objets au total, en français, concrets et adaptés à CE voyage (quantités selon la durée : "5 t-shirts légers", pas "des t-shirts").
+- Couvre la brosse à dents jusqu'aux vêtements : documents (passeport/CNI, visa ou e-visa si probable, assurance, billets), argent (devise locale, carte sans frais), vêtements, chaussures, hygiène, santé (trousse, médicaments utiles au pays, répulsif si zone à moustiques), électronique (adaptateur de prise du pays, batterie externe), météo (selon les températures et la pluie), activités (selon les intérêts et lieux), divers.
+- "essential" = true seulement pour l'indispensable (8 à 12 objets).
+- "reason" : pourquoi pour CE voyage, 8 mots max (ex : "Prises de type C au Togo").
+- N'invente pas d'obligation administrative : écris "à vérifier" en cas de doute.
+- "key" parmi : ${PACKING_CATEGORIES.join(', ')} ; "title" = titre court avec la bonne casse (ex : "Documents").
+
+Réponds avec UNIQUEMENT un objet JSON : {"categories":[{"key":"documents","title":"Documents","items":[{"label":"Passeport","essential":true,"reason":"..."}]}]}`;
+
+    const parse = (text: string) =>
+      this.sanitizePacking(JSON.parse(text.replace(/```json/g, '').replace(/```/g, '').trim())?.categories);
+
+    if (this.genAI) {
+      for (const modelName of ['gemini-3.5-flash-lite', 'gemini-flash-lite-latest', 'gemini-flash-latest']) {
+        try {
+          const model = this.genAI.getGenerativeModel({
+            model: modelName,
+            generationConfig: { responseMimeType: 'application/json', responseSchema: PACKING_RESPONSE_SCHEMA, temperature: 0.4 },
+          });
+          const list = parse((await model.generateContent(prompt)).response.text());
+          if (list.length) return list;
+        } catch (err: any) {
+          this.logger.warn(`Packing list with ${modelName} failed: ${err.message}`);
+        }
+      }
+    }
+    if (this.anthropic) {
+      try {
+        const message = await this.anthropic.messages.create({
+          model: 'claude-haiku-4-5',
+          max_tokens: 3000,
+          messages: [{ role: 'user', content: prompt }],
+        });
+        const textBlock = message.content.find((b): b is Anthropic.TextBlock => b.type === 'text');
+        if (textBlock) {
+          const list = parse(textBlock.text);
+          if (list.length) return list;
+        }
+      } catch (err: any) {
+        this.logger.warn(`Packing list with Claude failed: ${err.message}`);
+      }
+    }
+    return this.defaultPackingList(days, minT, maxT, rainy > 0);
+  }
+
+  private sanitizePacking(raw: any): PackingCategoryDraft[] {
+    if (!Array.isArray(raw)) return [];
+    const byKey = new Map<string, PackingCategoryDraft>();
+    for (const c of raw) {
+      const key = PACKING_CATEGORIES.includes(c?.key) ? c.key : 'divers';
+      const items: PackingItemDraft[] = (Array.isArray(c?.items) ? c.items : [])
+        .filter((i: any) => typeof i?.label === 'string' && i.label.trim())
+        .map((i: any) => ({
+          label: i.label.trim().slice(0, 80),
+          essential: !!i.essential,
+          reason: typeof i.reason === 'string' ? i.reason.trim().slice(0, 80) : undefined,
+        }));
+      if (!items.length) continue;
+      const existing = byKey.get(key);
+      if (existing) existing.items.push(...items);
+      else byKey.set(key, { key, title: String(c?.title || key).trim().slice(0, 40), items });
+    }
+    // Ordre logique : des papiers aux activités
+    return PACKING_CATEGORIES.filter((k) => byKey.has(k)).map((k) => {
+      const cat = byKey.get(k)!;
+      const seen = new Set<string>();
+      cat.items = cat.items.filter((i) => !seen.has(i.label.toLowerCase()) && seen.add(i.label.toLowerCase())).slice(0, 15);
+      return cat;
+    });
+  }
+
+  /** Liste de base, adaptée à la durée et aux températures connues. */
+  private defaultPackingList(days: number, minT: number | null, maxT: number | null, rain: boolean): PackingCategoryDraft[] {
+    const tops = Math.min(days, 7);
+    const hot = maxT != null && maxT >= 26;
+    const cold = minT != null && minT <= 8;
+    return [
+      { key: 'documents', title: 'Documents', items: [
+        { label: "Passeport ou carte d'identité", essential: true, reason: 'Contrôles et hôtels' },
+        { label: 'Billets et réservations', essential: true },
+        { label: 'Assurance voyage', essential: true },
+      ] },
+      { key: 'argent', title: 'Argent', items: [
+        { label: 'Carte bancaire', essential: true },
+        { label: 'Un peu de devise locale', essential: false, reason: 'Petits achats et pourboires' },
+      ] },
+      { key: 'vetements', title: 'Vêtements', items: [
+        { label: `${tops} hauts`, essential: true },
+        { label: `${Math.max(2, Math.ceil(days / 2))} bas`, essential: false },
+        { label: `${tops} sous-vêtements et paires de chaussettes`, essential: true },
+        { label: 'Tenue de nuit', essential: false },
+        ...(cold ? [{ label: 'Manteau chaud, bonnet et gants', essential: true, reason: `Jusqu'à ${Math.round(minT!)}°C` }] : []),
+        ...(hot ? [{ label: 'Vêtements légers et respirants', essential: false, reason: `Jusqu'à ${Math.round(maxT!)}°C` }] : []),
+      ] },
+      { key: 'chaussures', title: 'Chaussures', items: [{ label: 'Chaussures de marche confortables', essential: true }] },
+      { key: 'hygiene', title: 'Hygiène', items: [
+        { label: 'Brosse à dents et dentifrice', essential: true },
+        { label: 'Déodorant', essential: false },
+        { label: 'Gel douche et shampoing (format voyage)', essential: false },
+      ] },
+      { key: 'sante', title: 'Santé', items: [
+        { label: 'Médicaments personnels et ordonnances', essential: true },
+        { label: 'Petite trousse de secours', essential: false },
+      ] },
+      { key: 'electronique', title: 'Électronique', items: [
+        { label: 'Téléphone et chargeur', essential: true },
+        { label: 'Batterie externe', essential: false },
+        { label: 'Adaptateur de prise', essential: false, reason: 'À vérifier selon le pays' },
+      ] },
+      { key: 'meteo', title: 'Météo', items: [
+        ...(hot ? [{ label: 'Crème solaire et lunettes de soleil', essential: true }] : []),
+        ...(rain ? [{ label: 'Parapluie ou veste imperméable', essential: true, reason: 'Pluie annoncée' }] : []),
+        { label: 'Gourde réutilisable', essential: false },
+      ] },
+    ];
   }
 
   /** Les pépites ne sont demandées que pour un voyage classique (pas pour un vote de tribu). */
