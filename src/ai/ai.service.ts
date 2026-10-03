@@ -165,7 +165,16 @@ const NEXT_DESTINATIONS_SCHEMA: ResponseSchema = {
 };
 
 export interface BookingEstimatesDraft {
-  stays: { index: number; area: string; why: string; nightly_min: number; nightly_max: number; tip?: string }[];
+  stays: {
+    index: number;
+    area: string;
+    why: string;
+    nightly_min: number;
+    nightly_max: number;
+    tip?: string;
+    /** Autres façons de dormir sur cette étape, dont au moins une sous le plafond */
+    options?: { kind: string; area: string; nightly_min: number; nightly_max: number; why: string }[];
+  }[];
   activities: { name: string; price_adult: number; price_child?: number; advice?: string }[];
   local_transport?: { name: string; price_per_day: number; tip?: string };
   meals_per_person_per_day?: number;
@@ -185,6 +194,20 @@ const BOOKING_ESTIMATES_SCHEMA: ResponseSchema = {
           nightly_min: { type: SchemaType.NUMBER },
           nightly_max: { type: SchemaType.NUMBER },
           tip: { type: SchemaType.STRING },
+          options: {
+            type: SchemaType.ARRAY,
+            items: {
+              type: SchemaType.OBJECT,
+              properties: {
+                kind: { type: SchemaType.STRING },
+                area: { type: SchemaType.STRING },
+                nightly_min: { type: SchemaType.NUMBER },
+                nightly_max: { type: SchemaType.NUMBER },
+                why: { type: SchemaType.STRING },
+              },
+              required: ['kind', 'area', 'nightly_min', 'nightly_max', 'why'],
+            },
+          },
         },
         required: ['index', 'area', 'why', 'nightly_min', 'nightly_max'],
       },
@@ -781,6 +804,8 @@ Réponds avec UNIQUEMENT un objet JSON : {"suggestions":[{"destination":"...","c
     stays: { index: number; days: string; near: string[] }[];
     places: string[];
     transports: string[];
+    /** Plafond par nuit pour tout le groupe, tiré du budget */
+    nightly_cap?: number;
   }): Promise<BookingEstimatesDraft | null> {
     const kids = input.children_ages.length ? `, enfants de ${input.children_ages.join(', ')} ans` : '';
     const prompt = `Tu es Voyago, expert des réservations de voyage et du budget. Donne des estimations RÉALISTES et prudentes en ${input.currency}.
@@ -794,6 +819,7 @@ Lieux de l'itinéraire : ${input.places.slice(0, 20).join(' ; ')}
 
 Réponds :
 - "stays" : pour chaque étape, le quartier idéal où dormir ("area", nom réel), "why" (1 phrase, 15 mots max : proximité, ambiance, sécurité, famille), "nightly_min"/"nightly_max" = prix réaliste d'une nuit pour TOUT le groupe au standing ${input.level}, "tip" (conseil de réservation, 12 mots max).
+  Ajoute "options" : 3 AUTRES façons de dormir pour cette étape, variées (ex : pension familiale, appartement, auberge avec chambre privée, hôtel 3★, maison d'hôtes), chacune avec "kind" (type, 4 mots max), "area" (quartier réel, voisin si moins cher), "nightly_min"/"nightly_max" (tout le groupe) et "why" (12 mots max).${input.nightly_cap ? ` Le plafond du voyageur est de ${input.nightly_cap} ${input.currency} la nuit : au moins 2 options doivent tenir SOUS ce plafond.` : ''}
 - "activities" : uniquement les lieux PAYANTS de la liste (nom exact), "price_adult" et "price_child" (0 si gratuit pour les enfants), "advice" (ex : "Réserver en ligne : file d'attente évitée", 10 mots max). Omets les lieux gratuits et les restaurants.
 - "local_transport" : le meilleur pass ou mode local (nom réel, ex : carte Navegante, Suica), "price_per_day" par personne, "tip".
 - "meals_per_person_per_day" : budget repas réaliste par adulte et par jour au standing ${input.level}.
@@ -813,6 +839,16 @@ N'invente jamais de remise ni de partenariat. Réponds avec UNIQUEMENT l'objet J
             nightly_min: num(s.nightly_min),
             nightly_max: Math.max(num(s.nightly_max), num(s.nightly_min)),
             tip: s.tip ? String(s.tip).trim().slice(0, 100) : undefined,
+            options: (Array.isArray(s.options) ? s.options : [])
+              .filter((o: any) => typeof o?.kind === 'string' && typeof o?.area === 'string' && num(o.nightly_min) > 0)
+              .slice(0, 3)
+              .map((o: any) => ({
+                kind: o.kind.trim().slice(0, 40),
+                area: o.area.trim().slice(0, 60),
+                nightly_min: num(o.nightly_min),
+                nightly_max: Math.max(num(o.nightly_max), num(o.nightly_min)),
+                why: String(o.why || '').trim().slice(0, 110),
+              })),
           })),
         activities: (Array.isArray(raw.activities) ? raw.activities : [])
           .filter((a: any) => typeof a?.name === 'string' && num(a.price_adult) > 0)
@@ -853,7 +889,7 @@ N'invente jamais de remise ni de partenariat. Réponds avec UNIQUEMENT l'objet J
       try {
         const message = await this.anthropic.messages.create({
           model: 'claude-haiku-4-5',
-          max_tokens: 2500,
+          max_tokens: 4000,
           messages: [{ role: 'user', content: prompt }],
         });
         const textBlock = message.content.find((b): b is Anthropic.TextBlock => b.type === 'text');

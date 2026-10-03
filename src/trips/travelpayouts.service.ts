@@ -253,26 +253,31 @@ export class TravelpayoutsService {
       if (hit && Date.now() - hit.at < hit.ttl) out[u] = hit.value;
       else missing.push(u);
     }
-    for (let i = 0; i < missing.length; i += 10) {
-      const batch = missing.slice(i, i + 10);
-      try {
-        const res = await axios.post(
-          'https://api.travelpayouts.com/links/v1/create',
-          { trs: Number(trs) || trs, marker: Number(this.marker) || this.marker, shorten: false, links: batch.map((url) => ({ url })) },
-          { headers: { 'X-Access-Token': this.token, 'Content-Type': 'application/json' }, timeout: 5000 },
-        );
-        const links: any[] = res.data?.result?.links || res.data?.links || [];
-        batch.forEach((u, idx) => {
-          const l = links.find((x) => x?.url === u) || links[idx];
-          const partner = l && (!l.code || l.code === 'success') ? l.partner_url || l.short_url : null;
-          out[u] = partner || u;
-          this.cache.set(`link:${u}`, { at: Date.now(), ttl: partner ? LINK_TTL_MS : 3600_000, value: out[u] });
-        });
-      } catch (e: any) {
-        this.logger.warn(`Liens partenaires non convertis : ${e.message}`);
-        for (const u of batch) out[u] = u;
-      }
-    }
+    // Lots de 10 liens envoyés en parallèle (limite de l'API)
+    const batches: string[][] = [];
+    for (let i = 0; i < missing.length; i += 10) batches.push(missing.slice(i, i + 10));
+    await Promise.all(
+      batches.map(async (batch) => {
+        try {
+          const res = await axios.post(
+            'https://api.travelpayouts.com/links/v1/create',
+            { trs: Number(trs) || trs, marker: Number(this.marker) || this.marker, shorten: false, links: batch.map((url) => ({ url })) },
+            { headers: { 'X-Access-Token': this.token, 'Content-Type': 'application/json' }, timeout: 5000 },
+          );
+          const links: any[] = res.data?.result?.links || res.data?.links || [];
+          batch.forEach((u, idx) => {
+            const l = links.find((x) => x?.url === u) || links[idx];
+            const partner = l && (!l.code || l.code === 'success') ? l.partner_url || l.short_url : null;
+            out[u] = partner || u;
+            // Marque pas encore validée : nouvel essai dans une heure
+            this.cache.set(`link:${u}`, { at: Date.now(), ttl: partner ? LINK_TTL_MS : 3600_000, value: out[u] });
+          });
+        } catch (e: any) {
+          this.logger.warn(`Liens partenaires non convertis : ${e.response?.data?.message || e.message}`);
+          for (const u of batch) out[u] = u;
+        }
+      }),
+    );
     return out;
   }
 

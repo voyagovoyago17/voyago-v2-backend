@@ -10,6 +10,15 @@ import { GLOBAL_DB_CONNECTION } from '../common/constants';
 import { TripDocument, TripSchema } from './schemas/trip.schema';
 import { distanceMeters } from './trip-gems.service';
 import { TravelpayoutsService } from './travelpayouts.service';
+import {
+  AFFILIATE_PARTNERS,
+  PartnerChoice,
+  activityChoices,
+  carChoices,
+  esimChoices,
+  lodgingChoices,
+  transferChoices,
+} from './partner-links';
 
 /** Budget par personne et par jour quand le voyageur n'a pas annoncé de montant (EUR) */
 const DAILY_BUDGET_BY_LEVEL: Record<string, number> = { economique: 70, moyen: 140, luxe: 320 };
@@ -53,7 +62,7 @@ export class TripBookingsService {
     const TripModel = await this.tripModel(userId);
     const trip: any = await TripModel.findOne({ id: tripId, user_id: userId })
       .select(
-        'id destination city country duration_days start_date budget budget_amount currency travelers transports pois weather bookings_plan bookings cover_image_url',
+        'id destination city country country_code duration_days start_date budget budget_amount currency travelers transports pois weather bookings_plan bookings cover_image_url',
       )
       .lean()
       .exec();
@@ -68,6 +77,7 @@ export class TripBookingsService {
   async get(userId: string, tripId: string) {
     const trip = await this.loadTrip(userId, tripId);
     const user: any = await this.userModel.findOne({ user_id: userId }).select('city country').lean().exec();
+    const choiceLists: PartnerChoice[][] = [];
 
     const currency = trip.currency || 'EUR';
     const level = SPLIT_BY_LEVEL[trip.budget] ? trip.budget : 'moyen';
@@ -92,12 +102,13 @@ export class TripBookingsService {
 
     const stays = this.buildStays(trip);
     const startDate = this.parseDay(trip.start_date);
+    const lodgingNightCap = nights ? Math.round(allocation.lodging / nights) : 0;
     const home = user?.city || user?.country;
     const where = trip.city || trip.destination;
     const returnDate = startDate ? this.addDays(startDate, days - 1) : null;
     // Estimations IA et vrais prix des vols en parallèle (le vol ne bloque jamais l'écran)
     const [estimates, flight] = await Promise.all([
-      this.estimates(userId, trip, stays, level, currency, adults, kids),
+      this.estimates(userId, trip, stays, level, currency, adults, kids, lodgingNightCap),
       home
         ? this.withTimeout(
             this.travelpayouts.flightQuote({ from: home, to: where, departure: startDate, returnDate, currency, adults, kids }),
@@ -105,7 +116,6 @@ export class TripBookingsService {
           )
         : Promise.resolve(null),
     ]);
-    const lodgingNightCap = nights ? Math.round(allocation.lodging / nights) : 0;
 
     const staysDto = stays.map((stay) => {
       const est = estimates?.stays.find((s) => s.index === stay.index);
@@ -113,6 +123,35 @@ export class TripBookingsService {
       const checkout = startDate ? this.addDays(startDate, stay.fromDay - 1 + stay.nights) : null;
       const area = est?.area || stay.label;
       const where = `${area}, ${trip.city || trip.destination}`;
+      const city = trip.city || trip.destination;
+      const search = { checkin, checkout, adults, kids, currency, maxPerNight: lodgingNightCap };
+      const bookingUrl = this.bookingUrl({ where, ...search });
+      const airbnbUrl = this.airbnbUrl({ where, ...search });
+      const choices = lodgingChoices({ where, ...search }, bookingUrl, airbnbUrl);
+      choiceLists.push(choices);
+      // Autres façons de dormir, les moins chères d'abord, chacune avec ses recherches pré-remplies
+      const options = (est?.options || [])
+        .map((o) => {
+          const optWhere = `${o.area}, ${city}`;
+          // Filtre de prix à la hauteur de l'option (sinon une option à peine au-dessus serait masquée)
+          const optSearch = { ...search, maxPerNight: Math.max(lodgingNightCap, o.nightly_max) };
+          const optChoices = lodgingChoices(
+            { where: optWhere, ...optSearch },
+            this.bookingUrl({ where: optWhere, ...optSearch }),
+            this.airbnbUrl({ where: optWhere, ...optSearch }),
+          ).filter((c) => c.partner === 'booking' || c.partner === 'airbnb');
+          choiceLists.push(optChoices);
+          return {
+            kind: o.kind,
+            area: o.area,
+            why: o.why,
+            nightly_min: o.nightly_min,
+            nightly_max: o.nightly_max,
+            fits_budget: !lodgingNightCap || o.nightly_min <= lodgingNightCap,
+            choices: optChoices,
+          };
+        })
+        .sort((a, b) => a.nightly_min - b.nightly_min);
       return {
         index: stay.index,
         from_day: stay.fromDay,
@@ -127,10 +166,9 @@ export class TripBookingsService {
         nightly_budget: lodgingNightCap,
         checkin,
         checkout,
-        links: {
-          booking: this.bookingUrl({ where, checkin, checkout, adults, kids, currency, maxPerNight: lodgingNightCap }),
-          airbnb: this.airbnbUrl({ where, checkin, checkout, adults, kids, maxPerNight: lodgingNightCap }),
-        },
+        links: { booking: bookingUrl, airbnb: airbnbUrl },
+        choices,
+        options,
       };
     }).filter((s) => s.nights > 0);
 
@@ -160,11 +198,16 @@ export class TripBookingsService {
     }
     const center = stays[0]?.center;
     if (center && modes.some((m) => /voiture|car/.test(m))) {
+      const choices = carChoices();
+      choiceLists.push(choices);
       transport.push({
         kind: 'car',
         title: 'Location de voiture',
-        subtitle: `${days} jour${days > 1 ? 's' : ''} · agences près de ton hébergement`,
-        link: `https://www.google.com/maps/search/location+de+voiture/@${center.lat},${center.lng},13z`,
+        subtitle: startDate
+          ? `Du ${this.frDate(startDate)} au ${this.frDate(this.addDays(startDate, days - 1))} · ${days} jour${days > 1 ? 's' : ''}`
+          : `${days} jour${days > 1 ? 's' : ''} sur place`,
+        link: choices[0].url,
+        choices,
       });
     }
     if (center && modes.some((m) => /velo|vélo|bike/.test(m))) {
@@ -193,7 +236,37 @@ export class TripBookingsService {
       cheaper_dates: (flight?.cheaper_dates ?? []).map((o) => ({ ...o, saving: best ? (best.price - o.price) * passengers : null })),
       live_prices: !!flight,
       outside_budget: true,
+      choices: [{ partner: 'aviasales', label: 'Aviasales', url: flight?.search_link || this.flightsUrl(home, where, startDate, returnDate, adults, kids.length) }],
     });
+
+    // Transfert aéroport → premier hébergement, à prix fixe
+    const firstStay = staysDto[0];
+    if (firstStay) {
+      const choices = transferChoices();
+      choiceLists.push(choices);
+      const people = adults + kids.length;
+      transport.splice(1, 0, {
+        kind: 'transfer',
+        title: `Aéroport → ${firstStay.area}`,
+        subtitle: `${startDate ? `Le ${this.frDate(startDate)} · ` : ''}${people} voyageur${people > 1 ? 's' : ''}${kids.length ? ', sièges enfant sur demande' : ''} · prix fixé à la réservation`,
+        link: choices[0].url,
+        choices,
+      });
+    }
+
+    // eSIM : internet dès l'atterrissage, sans frais d'itinérance
+    const sameCountry = user?.country && trip.country && String(user.country).trim().toLowerCase() === String(trip.country).trim().toLowerCase();
+    if (trip.country && !sameCountry) {
+      const choices = esimChoices(trip.country_code);
+      choiceLists.push(choices);
+      transport.push({
+        kind: 'esim',
+        title: `eSIM ${trip.country}`,
+        subtitle: 'Internet dès l’atterrissage, sans frais d’itinérance ni carte SIM à changer',
+        link: choices[0].url,
+        choices,
+      });
+    }
 
     // Activités payantes (estimations), avec billets en ligne
     const activities = (estimates?.activities || []).map((a) => {
@@ -207,9 +280,14 @@ export class TripBookingsService {
         price_group: price,
         advice: a.advice || null,
         image_url: poi?.image_url || null,
-        link: `https://www.getyourguide.fr/s/?q=${encodeURIComponent(`${a.name} ${trip.city || trip.destination}`)}`,
+        link: '',
+        choices: activityChoices(a.name, trip.city || trip.destination),
       };
     });
+    for (const a of activities) {
+      a.link = a.choices[0].url;
+      choiceLists.push(a.choices);
+    }
 
     const meals = estimates?.meals_per_person_per_day
       ? Math.round(estimates.meals_per_person_per_day * days * shares)
@@ -224,17 +302,14 @@ export class TripBookingsService {
       dailyBudget: Math.round(total / days),
     });
 
-    // Liens partenaires affiliés (Booking.com, GetYourGuide…) quand le projet Travelpayouts est configuré
-    const links = await this.withTimeout(
-      this.travelpayouts.affiliate([
-        ...staysDto.map((x) => x.links.booking),
-        ...activities.map((a) => a.link),
-      ]),
-      4000,
-    );
-    if (links) {
-      for (const x of staysDto) x.links.booking = links[x.links.booking] || x.links.booking;
-      for (const a of activities) a.link = links[a.link] || a.link;
+    // Liens affiliés Travelpayouts pour toutes les marques partenaires (les autres restent tels quels)
+    const toConvert = choiceLists.flat().filter((c) => AFFILIATE_PARTNERS.has(c.partner)).map((c) => c.url);
+    const converted = await this.withTimeout(this.travelpayouts.affiliate(toConvert), 4500);
+    if (converted) {
+      for (const c of choiceLists.flat()) c.url = converted[c.url] || c.url;
+      for (const x of staysDto) x.links.booking = x.choices.find((c) => c.partner === 'booking')?.url || x.links.booking;
+      for (const a of activities) a.link = a.choices[0].url;
+      for (const t of transport) if (t.choices?.length && t.kind !== 'flight') t.link = t.choices[0].url;
     }
 
     const booked = (trip.bookings || []) as any[];
@@ -418,8 +493,10 @@ export class TripBookingsService {
     currency: string,
     adults: number,
     kids: number[],
+    nightlyCap: number,
   ): Promise<BookingEstimatesDraft | null> {
-    const basis = [trip.start_date || '', trip.duration_days, level, currency, adults, kids.join('.'), stays.length].join('|');
+    // v2 : options d'hébergement sous le plafond
+    const basis = ['v2', trip.start_date || '', trip.duration_days, level, currency, adults, kids.join('.'), stays.length, nightlyCap].join('|');
     if (trip.bookings_plan?.basis === basis && trip.bookings_plan?.estimates) return trip.bookings_plan.estimates;
 
     const key = `${userId}:${trip.id}:${basis}`;
@@ -442,6 +519,7 @@ export class TripBookingsService {
             })),
             places: (trip.pois || []).filter((p: any) => p.order !== 2).map((p: any) => p.name),
             transports: trip.transports || [],
+            nightly_cap: nightlyCap || undefined,
           });
           if (estimates) {
             const TripModel = await this.tripModel(userId);
